@@ -1,0 +1,73 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Stock {
+  id        Int        @id @default(autoincrement())
+  symbol    String     @unique
+  market    String     // "CN" | "US"
+  name      String
+  positions Position[]
+  createdAt DateTime   @default(now())
+}
+
+model Position {
+  id           Int         @id @default(autoincrement())
+  stockId      Int
+  stock        Stock       @relation(fields: [stockId], references: [id])
+  status       String      @default("OPEN") // "OPEN" | "CLOSED"
+  openedAt     DateTime    @default(now())
+  closedAt     DateTime?
+  totalShares  Float       @default(0)
+  avgCost      Float       @default(0)
+  totalCost    Float       @default(0)
+  realizedPnl  Float?
+  buyRecords   BuyRecord[]
+  sellRecords  SellRecord[]
+  refreshLogs  RefreshLog[]
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+}
+
+model BuyRecord {
+  id               Int      @id @default(autoincrement())
+  positionId       Int
+  position         Position @relation(fields: [positionId], references: [id])
+  boughtAt         DateTime
+  shares           Float
+  price            Float
+  amount           Float
+  thesis           String
+  thesisPointsJson String   @default("[]") // JSON array of thesis points
+  snapshotJson     String   @default("{}") // JSON snapshot at buy time
+  createdAt        DateTime @default(now())
+}
+
+model RefreshLog {
+  id           Int      @id @default(autoincrement())
+  positionId   Int
+  position     Position @relation(fields: [positionId], references: [id])
+  refreshedAt  DateTime @default(now())
+  snapshotJson String   @default("{}") // latest snapshot JSON
+  analysisJson String   @default("{}") // LLM structured analysis
+  verdict      String   @default("SUPPORT") // "SUPPORT" | "WEAKEN" | "BROKEN"
+}
+
+model SellRecord {
+  id               Int      @id @default(autoincrement())
+  positionId       Int
+  position         Position @relation(fields: [positionId], references: [id])
+  soldAt           DateTime
+  shares           Float
+  price            Float
+  amount           Float
+  reason           String   // e.g. "止盈|details"
+  consistencyScore Float?
+  consistencyNote  String?
+  createdAt        DateTime @default(now())
+}
