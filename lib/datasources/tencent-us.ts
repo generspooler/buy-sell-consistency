@@ -40,7 +40,7 @@ function toQuoteSymbol(symbol: string): string {
 }
 
 /** Unescape \uXXXX sequences smartbox uses for non-ASCII names */
-function unescapeUnicode(s: string): string {
+export function unescapeUnicode(s: string): string {
   return s.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
     String.fromCharCode(parseInt(hex, 16))
   )

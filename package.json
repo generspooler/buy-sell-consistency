@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "stop": "kill $(lsof -ti tcp:${PORT:-3000}) 2>/dev/null || echo \"Server not running on port ${PORT:-3000}\"",
     "lint": "eslint"
   },
   "dependencies": {
