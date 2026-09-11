@@ -45,6 +45,7 @@ model BuyRecord {
   thesis           String
   thesisPointsJson String   @default("[]") // JSON array of thesis points
   snapshotJson     String   @default("{}") // JSON snapshot at buy time
+  analysisJson     String?  // latest refresh conclusion captured at add-buy time
   createdAt        DateTime @default(now())
 }
 
@@ -67,6 +68,8 @@ model SellRecord {
   price            Float
   amount           Float
   reason           String   // e.g. "止盈|details"
+  realizedPnl      Float?
+  pnlPct           Float?
   consistencyScore Float?
   consistencyNote  String?
   createdAt        DateTime @default(now())

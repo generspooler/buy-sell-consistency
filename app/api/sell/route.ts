@@ -78,6 +78,8 @@ export async function POST(req: NextRequest) {
         price,
         amount,
         reason: note ? `${reason}|${note}` : reason,
+        realizedPnl,
+        pnlPct,
         consistencyScore: score,
         consistencyNote: comment,
       },

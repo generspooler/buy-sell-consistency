@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { MarketDataService } from '@/lib/market-data'
 import { extractThesisPoints } from '@/lib/llm-analyzer'
-import { Market } from '@/lib/types'
+import { AnalysisResult, Market } from '@/lib/types'
 
 const marketDataService = new MarketDataService()
 
@@ -115,6 +115,32 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // 加仓沿用刷新结论：把加仓当时最近一次刷新分析定格到本条记录上，历史记录
+    // 时间线据此说明「在什么判断下加的仓」。没有刷新记录时留空，UI 显示未分析。
+    let addBuyAnalysis: string | null = null
+    if (addPositionId) {
+      const lastRefresh = await prisma.refreshLog.findFirst({
+        where: { positionId: position.id },
+        orderBy: { refreshedAt: 'desc' },
+        select: { id: true, refreshedAt: true, verdict: true, analysisJson: true },
+      })
+      if (lastRefresh) {
+        let analysis: Partial<AnalysisResult> = {}
+        try {
+          analysis = JSON.parse(lastRefresh.analysisJson || '{}')
+        } catch {}
+        addBuyAnalysis = JSON.stringify({
+          source: 'REFRESH',
+          refreshLogId: lastRefresh.id,
+          refreshedAt: lastRefresh.refreshedAt,
+          verdict: lastRefresh.verdict,
+          actionSuggestion: analysis.actionSuggestion ?? '',
+          trendAnalysis: analysis.trendAnalysis ?? '',
+          confidence: analysis.confidence ?? null,
+        })
+      }
+    }
+
     // Persist buy record immediately — points extraction may follow
     const buyRecord = await prisma.buyRecord.create({
       data: {
@@ -126,6 +152,7 @@ export async function POST(req: NextRequest) {
         thesis: thesis || '',
         thesisPointsJson: '[]',
         snapshotJson: snapshot,
+        analysisJson: addBuyAnalysis,
       },
     })
 
@@ -156,6 +183,7 @@ export async function POST(req: NextRequest) {
       positionId: position.id,
       buyRecordId: buyRecord.id,
       thesisPoints,
+      analysis: addBuyAnalysis ? JSON.parse(addBuyAnalysis) : null,
     })
   } catch (e) {
     console.error('/api/trades POST error:', e)

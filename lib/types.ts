@@ -98,6 +98,59 @@ export interface AnalysisResult {
   confidence: number
 }
 
+// ─── History Timeline (历史记录) ──────────────────────────────────────────────
+
+export type HistoryEventType = 'BUY' | 'ADD_BUY' | 'REFRESH' | 'SELL'
+
+/** 加仓时定格的刷新结论——加仓不另跑 LLM，沿用当时最近一次刷新分析。 */
+export interface AddBuyAnalysis {
+  source: 'REFRESH'
+  refreshLogId: number
+  refreshedAt: string
+  verdict: Verdict
+  actionSuggestion: string
+  trendAnalysis: string
+  confidence: number | null
+}
+
+export interface HistoryEventBase {
+  id: string          // e.g. "buy-3" — unique across types
+  type: HistoryEventType
+  at: string          // ISO timestamp used for ordering
+}
+
+export interface BuyEvent extends HistoryEventBase {
+  type: 'BUY' | 'ADD_BUY'
+  shares: number
+  price: number
+  amount: number
+  thesis: string
+  thesisPoints: ThesisPoint[]
+  snapshot: StockSnapshot | null
+  analysis: AddBuyAnalysis | null   // ADD_BUY 才有
+}
+
+export interface RefreshEvent extends HistoryEventBase {
+  type: 'REFRESH'
+  verdict: Verdict
+  analysis: AnalysisResult | null
+}
+
+export interface SellEvent extends HistoryEventBase {
+  type: 'SELL'
+  shares: number
+  price: number
+  amount: number
+  reason: string
+  note: string
+  realizedPnl: number | null   // 已实现盈亏，旧记录为 null
+  pnlPct: number | null
+  consistencyScore: number | null
+  consistencyNote: string | null
+}
+
+export type HistoryEvent = BuyEvent | RefreshEvent | SellEvent
+
 // ─── API Response Types ───────────────────────────────────────────────────────
 
 export interface PositionSummary {
