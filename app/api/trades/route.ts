@@ -3,6 +3,7 @@ import { prisma } from '@/lib/db'
 import { MarketDataService } from '@/lib/market-data'
 import { extractThesisPoints } from '@/lib/llm-analyzer'
 import { AnalysisResult, Market } from '@/lib/types'
+import { parseReentryPlan, serializeReentryPlan } from '@/lib/reentry'
 
 const marketDataService = new MarketDataService()
 
@@ -44,11 +45,11 @@ export async function POST(req: NextRequest) {
     const amount = shares * price
 
     // Locate the target position: explicit addPositionId (加仓) or by stock
-    let position: { id: number; totalShares: number; totalCost: number } | null = null
+    let position: { id: number; stockId: number; totalShares: number; totalCost: number } | null = null
     if (addPositionId) {
       position = await prisma.position.findFirst({
         where: { id: addPositionId, status: 'OPEN' },
-        select: { id: true, totalShares: true, totalCost: true },
+        select: { id: true, stockId: true, totalShares: true, totalCost: true },
       })
       if (!position) {
         return NextResponse.json({ error: 'Open position not found' }, { status: 404 })
@@ -62,7 +63,7 @@ export async function POST(req: NextRequest) {
       })
       position = await prisma.position.findFirst({
         where: { stockId: stock.id, status: 'OPEN' },
-        select: { id: true, totalShares: true, totalCost: true },
+        select: { id: true, stockId: true, totalShares: true, totalCost: true },
       })
       if (!position) {
         position = await prisma.position.create({
@@ -74,7 +75,7 @@ export async function POST(req: NextRequest) {
             avgCost: 0,
             totalCost: 0,
           },
-          select: { id: true, totalShares: true, totalCost: true },
+          select: { id: true, stockId: true, totalShares: true, totalCost: true },
         })
       }
     }
@@ -156,6 +157,45 @@ export async function POST(req: NextRequest) {
       },
     })
 
+    // 买回执行留痕：同股存在 ARMED/FIRED 买回计划时，这笔买入自动关联
+    // 为计划的执行（executedFrom 区分「触发后买回」与「未触发即买回」）。
+    // 闭环「声明→触发→执行」，计划执行率从此可复盘。
+    const executedPlans: Array<{
+      sellRecordId: number
+      triggerPrice: number
+      executedFrom: 'ARMED' | 'FIRED'
+    }> = []
+    try {
+      const sellsOfStock = await prisma.sellRecord.findMany({
+        where: { position: { stockId: position.stockId } },
+        orderBy: { soldAt: 'desc' },
+      })
+      for (const sr of sellsOfStock) {
+        const plan = parseReentryPlan(sr.reentryPlanJson)
+        if (!plan || (plan.status !== 'ARMED' && plan.status !== 'FIRED')) continue
+        const from = plan.status
+        const executed = {
+          ...plan,
+          status: 'EXECUTED' as const,
+          executedAt: new Date().toISOString(),
+          executedBuyRecordId: buyRecord.id,
+          executedPositionId: position.id,
+          executedFrom: from,
+        }
+        await prisma.sellRecord.update({
+          where: { id: sr.id },
+          data: { reentryPlanJson: serializeReentryPlan(executed) },
+        })
+        executedPlans.push({
+          sellRecordId: sr.id,
+          triggerPrice: plan.trigger.price,
+          executedFrom: from,
+        })
+      }
+    } catch (e) {
+      console.warn('Reentry execution marking failed (non-fatal):', e)
+    }
+
     // Extract thesis points via LLM only for a NEW position's first buy with a
     // thesis. The buy page then calls /api/thesis-points separately with a
     // progress UI — a slow LLM never blocks or loses the record. 加仓 records
@@ -184,6 +224,7 @@ export async function POST(req: NextRequest) {
       buyRecordId: buyRecord.id,
       thesisPoints,
       analysis: addBuyAnalysis ? JSON.parse(addBuyAnalysis) : null,
+      executedPlans,
     })
   } catch (e) {
     console.error('/api/trades POST error:', e)

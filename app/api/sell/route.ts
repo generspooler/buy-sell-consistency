@@ -2,8 +2,17 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { scoreSellConsistency } from '@/lib/llm-analyzer'
 import { AnalysisResult, ThesisPoint } from '@/lib/types'
+import {
+  buildReentryPlan,
+  parseReentryPlan,
+  serializeReentryPlan,
+  buildPriorPlanContext,
+  ReentryPlan,
+  ReentryTrigger,
+} from '@/lib/reentry'
 
-// POST /api/sell — record a sell and compute consistency score
+// POST /api/sell — record a sell, compute consistency score, optionally create
+// a re-entry plan (买回计划) that future refreshes will check mechanically.
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
@@ -14,6 +23,7 @@ export async function POST(req: NextRequest) {
       price,
       reason,
       note,
+      reentry,
     } = body as {
       positionId: number
       soldAt: string
@@ -21,6 +31,12 @@ export async function POST(req: NextRequest) {
       price: number
       reason: string
       note?: string
+      reentry?: {
+        trigger: ReentryTrigger
+        shares: number
+        validDays?: number
+        source?: 'LLM' | 'MANUAL'
+      }
     }
 
     if (!positionId || !soldAt || !shares || !price || !reason) {
@@ -58,6 +74,23 @@ export async function POST(req: NextRequest) {
       } catch {}
     }
 
+    // Prior re-entry plans for the SAME stock (any position, any status):
+    // they feed the consistency prompt as 承诺兑现 background.
+    const priorSells = await prisma.sellRecord.findMany({
+      where: { position: { stockId: position.stockId } },
+      include: { position: { select: { stock: { select: { name: true } } } } },
+      orderBy: { soldAt: 'asc' },
+    })
+    const priorPlanContext = buildPriorPlanContext(
+      priorSells
+        .filter(sr => sr.id !== undefined && sr.reentryPlanJson)
+        .map(sr => ({
+          plan: parseReentryPlan(sr.reentryPlanJson)!,
+          stockName: sr.position.stock.name,
+          soldAt: sr.soldAt,
+        }))
+    )
+
     // Compute consistency score via LLM
     const { score, comment } = await scoreSellConsistency(
       position.stock.name,
@@ -66,8 +99,22 @@ export async function POST(req: NextRequest) {
       lastAnalysis,
       reason,
       note ?? '',
-      pnlPct
+      pnlPct,
+      priorPlanContext
     )
+
+    // Build re-entry plan if the user supplied trigger conditions
+    let reentryPlan: ReentryPlan | null = null
+    if (reentry && reentry.trigger && reentry.trigger.kind) {
+      reentryPlan = buildReentryPlan({
+        trigger: reentry.trigger,
+        sellPrice: price,
+        shares: reentry.shares ?? 0,
+        validDays: reentry.validDays,
+        source: reentry.source ?? 'MANUAL',
+        soldAt,
+      })
+    }
 
     // Record sell
     const sellRecord = await prisma.sellRecord.create({
@@ -82,6 +129,7 @@ export async function POST(req: NextRequest) {
         pnlPct,
         consistencyScore: score,
         consistencyNote: comment,
+        reentryPlanJson: reentryPlan ? serializeReentryPlan(reentryPlan) : null,
       },
     })
 
@@ -117,6 +165,7 @@ export async function POST(req: NextRequest) {
       consistencyScore: score,
       consistencyNote: comment,
       closed: newTotalShares <= 0,
+      reentryPlan,
     })
   } catch (e) {
     console.error('/api/sell POST error:', e)

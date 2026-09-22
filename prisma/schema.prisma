@@ -72,5 +72,6 @@ model SellRecord {
   pnlPct           Float?
   consistencyScore Float?
   consistencyNote  String?
+  reentryPlanJson  String?  // 买回计划（含状态机），见 lib/reentry.ts
   createdAt        DateTime @default(now())
 }

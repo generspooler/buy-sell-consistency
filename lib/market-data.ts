@@ -49,6 +49,22 @@ export class MarketDataService {
     return market === 'US' ? this.us : this.cnPrimary
   }
 
+  /**
+   * 获取 250 日 K 线（与 buildSnapshot 共用同一缓存键：刷新管道内先
+   * buildSnapshot 再 getCandles 不会产生第二次网络请求）。买回计划的
+   * 区间最低价判定用它。
+   */
+  async getCandles(symbol: string, market: Market): Promise<Candle[]> {
+    try {
+      const { value } = await this.withFallback(market, src =>
+        cached(`candles:${symbol}`, FINANCIAL_TTL, () => src.getCandles(symbol, 250))
+      )
+      return value
+    } catch {
+      return []
+    }
+  }
+
   private async withFallback<T>(
     market: Market,
     fn: (src: IMarketDataSource) => Promise<T>

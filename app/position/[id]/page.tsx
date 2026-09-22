@@ -4,7 +4,8 @@ import { useState, useEffect, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { fmtPrice } from '@/lib/format'
-import type { AddBuyAnalysis, HistoryEvent, HistoryEventType } from '@/lib/types'
+import { describeTrigger, pullbackToPrice, MIN_PULLBACK_PCT } from '@/lib/reentry'
+import type { AddBuyAnalysis, HistoryEvent, HistoryEventType, ReentryPlan } from '@/lib/types'
 
 interface Stock { symbol: string; name: string; market: string }
 interface BuyRecord {
@@ -18,6 +19,7 @@ interface RefreshLog {
 interface SellRecord {
   id: number; soldAt: string; shares: number; price: number
   amount: number; reason: string; consistencyScore?: number; consistencyNote?: string
+  reentryPlanJson?: string | null
 }
 interface Position {
   id: number; status: string; totalShares: number; avgCost: number
@@ -31,6 +33,14 @@ interface AnalysisResult {
   thesisPoints: Array<{ point: string; status: string; evidence: string; trend: string }>
   verdict: string; trendAnalysis: string; newsSignals: string[]
   actionSuggestion: string; confidence: number
+}
+interface ReentryDraft {
+  kind: 'PULLBACK' | 'PRICE'
+  value: number
+  pullbackPct: number
+  triggerPrice: number
+  shares: number
+  rationale: string
 }
 
 const VERDICT_COLOR: Record<string, string> = {
@@ -49,11 +59,40 @@ const EVENT_META: Record<HistoryEventType, { label: string; dot: string; chip: s
   ADD_BUY: { label: '加仓', dot: 'bg-emerald-400', chip: 'text-emerald-300 bg-emerald-400/10 border-emerald-400/20' },
   REFRESH: { label: '刷新分析', dot: 'bg-neutral-500', chip: 'text-neutral-300 bg-neutral-800 border-neutral-700' },
   SELL: { label: '卖出', dot: 'bg-rose-400', chip: 'text-rose-300 bg-rose-400/10 border-rose-400/20' },
+  REENTRY: { label: '买回计划', dot: 'bg-amber-400', chip: 'text-amber-300 bg-amber-400/10 border-amber-400/20' },
+}
+
+// REENTRY 事件按流转类型细分（同一套节点，不同徽章）
+const REENTRY_KIND_META: Record<string, { label: string; dot: string; chip: string }> = {
+  FIRED: { label: '买回触发', dot: 'bg-amber-400', chip: 'text-amber-200 bg-amber-400/15 border-amber-400/40 font-medium' },
+  EXECUTED: { label: '买回执行', dot: 'bg-emerald-400', chip: 'text-emerald-300 bg-emerald-400/10 border-emerald-400/30' },
+  EXPIRED: { label: '计划过期', dot: 'bg-neutral-500', chip: 'text-neutral-300 bg-neutral-800 border-neutral-700' },
+  CANCELLED: { label: '计划取消', dot: 'bg-neutral-600', chip: 'text-neutral-400 bg-neutral-800/60 border-neutral-700' },
+}
+
+// 买回计划当前状态徽章（卖出卡与顶栏共用）
+const PLAN_STATUS_META: Record<string, { label: string; chip: string }> = {
+  ARMED: { label: '监控中', chip: 'text-amber-300 bg-amber-400/10 border-amber-400/30' },
+  FIRED: { label: '已触发·待执行', chip: 'text-amber-200 bg-amber-400/15 border-amber-400/40 font-medium' },
+  EXECUTED: { label: '已买回执行', chip: 'text-emerald-300 bg-emerald-400/10 border-emerald-400/30' },
+  EXPIRED: { label: '已过期', chip: 'text-neutral-400 bg-neutral-800/60 border-neutral-700' },
+  CANCELLED: { label: '已取消', chip: 'text-neutral-400 bg-neutral-800/60 border-neutral-700' },
 }
 
 const fmtDateTime = (iso: string) => new Date(iso).toLocaleString('zh-CN')
 const fmtSigned = (n: number, digits = 0) => `${n >= 0 ? '+' : ''}${n.toFixed(digits)}`
 const pnlClass = (n: number) => (n >= 0 ? 'text-emerald-400' : 'text-rose-400')
+
+/** 客户端侧安全解析（服务端已在 history 中解析过，这里只为 sellRecords 原始行）。 */
+const parseReentryPlanJson = (raw?: string | null): ReentryPlan | null => {
+  if (!raw) return null
+  try {
+    const p = JSON.parse(raw) as ReentryPlan
+    return p?.trigger ? p : null
+  } catch {
+    return null
+  }
+}
 
 // 加仓沿用的刷新结论（加仓本身不再单独调用 LLM）
 function AddBuyAnalysisBlock({ analysis }: { analysis: AddBuyAnalysis | null }) {
@@ -100,11 +139,13 @@ function TradeFacts({ price, shares, amount }: { price: number; shares: number; 
 }
 
 function HistoryEventCard({ event }: { event: HistoryEvent }) {
-  const meta = EVENT_META[event.type]
+  const meta = event.type === 'REENTRY' ? REENTRY_KIND_META[event.kind] : EVENT_META[event.type]
   return (
-    <div className="relative pl-8">
+    <div className={`relative pl-8 ${event.type === 'REENTRY' && event.kind === 'FIRED' ? 'ring-2 ring-amber-400/40 rounded-xl' : ''}`}>
       <span className={`absolute left-[7px] top-5 h-2.5 w-2.5 -translate-x-1/2 rounded-full ring-4 ring-neutral-950 ${meta.dot}`} />
-      <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-5">
+      <div className={`rounded-xl border bg-neutral-900 p-5 ${
+        event.type === 'REENTRY' && event.kind === 'FIRED' ? 'border-amber-400/40' : 'border-neutral-800'
+      }`}>
         <div className="mb-3 flex items-center gap-3">
           <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${meta.chip}`}>
             {meta.label}
@@ -223,6 +264,62 @@ function HistoryEventCard({ event }: { event: HistoryEvent }) {
                 )}
               </div>
             )}
+            {event.reentryPlan && (
+              <div className="border-t border-neutral-800 pt-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-neutral-500">买回计划（卖出时声明）</span>
+                  {(() => {
+                    const m = PLAN_STATUS_META[event.reentryPlan.status]
+                    return m ? (
+                      <span className={`rounded-full border px-2 py-0.5 text-xs ${m.chip}`}>{m.label}</span>
+                    ) : null
+                  })()}
+                </div>
+                <p className="mt-1.5 text-sm text-neutral-300">
+                  {describeTrigger(event.reentryPlan.trigger, event.reentryPlan.sellPrice)}
+                  <span className="text-neutral-500"> · 有效 {event.reentryPlan.validDays} 天</span>
+                  {event.reentryPlan.shares > 0 && (
+                    <span className="text-neutral-500"> · 拟买回 {event.reentryPlan.shares} 股</span>
+                  )}
+                </p>
+                <p className="mt-1 text-xs text-neutral-500">
+                  {event.reentryPlan.source === 'LLM' ? 'AI 起草' : '手动设定'} ·
+                  {' '}此后每次刷新自动检查价格与论点双条件
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {event.type === 'REENTRY' && (
+          <div className="space-y-3">
+            <p className="text-sm text-neutral-200">
+              {describeTrigger(event.plan.trigger, event.plan.sellPrice)}
+              <span className="text-neutral-500"> · 有效 {event.plan.validDays} 天</span>
+              {event.plan.shares > 0 && (
+                <span className="text-neutral-500"> · 拟买回 {event.plan.shares} 股</span>
+              )}
+            </p>
+            {(() => {
+              const text =
+                event.kind === 'FIRED'
+                  ? event.plan.firedNote ?? '买回条件已达成。'
+                  : event.kind === 'EXECUTED'
+                    ? `买回已执行：${new Date(event.plan.executedAt ?? event.at).toLocaleDateString('zh-CN')} 记录买入${
+                        event.plan.executedFrom === 'FIRED'
+                          ? '（触发后按计划买回）'
+                          : '（未触发即提前买回，偏离声明条件）'
+                      }`
+                    : event.kind === 'EXPIRED'
+                      ? event.plan.lastNote ?? `计划满 ${event.plan.validDays} 天有效期，自动失效。`
+                      : '计划已取消。'
+              return <p className="text-sm leading-relaxed text-neutral-300">{text}</p>
+            })()}
+            {event.kind === 'FIRED' && (
+              <p className="text-xs text-amber-400/90">
+                条件达成 ≠ 买回理由成立：请先在「买入理由」页核对论点状态，再决定执行或放弃。
+              </p>
+            )}
           </div>
         )}
       </div>
@@ -231,6 +328,229 @@ function HistoryEventCard({ event }: { event: HistoryEvent }) {
 }
 
 type TabId = 'thesis' | 'history' | 'sell'
+
+// ── 买回计划输入（卖出表单内）────────────────────────────────────────────
+// 这是整个特性的入口：把「待回调买入」从一句话变成一个有数字的承诺。
+// LLM 只起草，数字由用户确认后随卖出一并锁定——与论点拆解同一套人机分工。
+function ReentryPlanFields({
+  enabled,
+  onToggle,
+  positionId,
+  sellPrice,
+  sellShares,
+  sellReason,
+  sellNote,
+  kind,
+  setKind,
+  value,
+  setValue,
+  shares,
+  setShares,
+  validDays,
+  setValidDays,
+  source,
+  setSource,
+  rationale,
+  setRationale,
+}: {
+  enabled: boolean
+  onToggle: (v: boolean) => void
+  positionId: number
+  sellPrice: string
+  sellShares: string
+  sellReason: string
+  sellNote: string
+  kind: 'PULLBACK' | 'PRICE'
+  setKind: (v: 'PULLBACK' | 'PRICE') => void
+  value: string
+  setValue: (v: string) => void
+  shares: string
+  setShares: (v: string) => void
+  validDays: string
+  setValidDays: (v: string) => void
+  source: 'LLM' | 'MANUAL'
+  setSource: (v: 'LLM' | 'MANUAL') => void
+  rationale: string
+  setRationale: (v: string) => void
+}) {
+  const [drafting, setDrafting] = useState(false)
+  const [draftError, setDraftError] = useState('')
+
+  const price = parseFloat(sellPrice)
+  const num = parseFloat(value)
+  const triggerPrice =
+    Number.isFinite(price) && Number.isFinite(num) && num > 0
+      ? kind === 'PULLBACK'
+        ? pullbackToPrice(price, num)
+        : num
+      : null
+  const pullbackPct =
+    triggerPrice != null && Number.isFinite(price) && price > 0
+      ? ((price - triggerPrice) / price) * 100
+      : null
+  const belowNoiseFloor = pullbackPct != null && pullbackPct < MIN_PULLBACK_PCT
+
+  const handleDraft = async () => {
+    if (!Number.isFinite(price) || !sellShares) {
+      setDraftError('请先填写卖出价与股数')
+      return
+    }
+    setDrafting(true)
+    setDraftError('')
+    try {
+      const res = await fetch('/api/reentry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          positionId,
+          price,
+          shares: parseFloat(sellShares),
+          reason: sellReason,
+          note: sellNote,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? '起草失败')
+      const d: ReentryDraft = data.draft
+      setKind(d.kind)
+      setValue(String(d.kind === 'PULLBACK' ? d.pullbackPct || d.value : d.triggerPrice))
+      if (d.shares > 0) setShares(String(d.shares))
+      setRationale(d.rationale ?? '')
+      setSource('LLM')
+    } catch (e) {
+      setDraftError((e as Error).message)
+    } finally {
+      setDrafting(false)
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-neutral-800 bg-neutral-900/60 p-4">
+      <label className="flex cursor-pointer items-start gap-3">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={e => {
+            const on = e.target.checked
+            // 默认拟买回 = 本次卖出股数（最常见意图：原样买回）。
+            if (on && !shares && sellShares) setShares(sellShares)
+            onToggle(on)
+          }}
+          className="mt-0.5 h-4 w-4 shrink-0 accent-amber-500"
+        />
+        <span>
+          <span className="text-sm font-medium text-neutral-200">制定买回计划</span>
+          <span className="mt-0.5 block text-xs text-neutral-500">
+            打算之后买回？现在就把触发价定下来。没有触发价的买回计划等于没有计划——
+            此后每次刷新会自动检查价格与论点，条件达成时提醒你。
+          </span>
+        </span>
+      </label>
+
+      {enabled && (
+        <div className="mt-4 space-y-4 border-t border-neutral-800 pt-4">
+          {/* 触发方式 */}
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <label className="text-sm font-medium text-neutral-300">触发条件</label>
+              <button
+                type="button"
+                onClick={handleDraft}
+                disabled={drafting}
+                className="rounded-lg border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:border-neutral-600 hover:text-neutral-200 disabled:opacity-50 transition-colors"
+              >
+                {drafting ? 'AI 起草中…' : '✨ AI 起草'}
+              </button>
+            </div>
+            <div className="flex gap-2">
+              {([
+                ['PULLBACK', '按回撤 %'],
+                ['PRICE', '按触发价'],
+              ] as const).map(([k, label]) => (
+                <button
+                  key={k}
+                  type="button"
+                  onClick={() => { setKind(k); setSource('MANUAL') }}
+                  className={`rounded-lg border px-3 py-1.5 text-sm transition-colors ${
+                    kind === k
+                      ? 'border-amber-500 bg-amber-500/15 text-amber-300'
+                      : 'border-neutral-700 text-neutral-400 hover:border-neutral-600'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <label className="mb-1.5 block text-xs text-neutral-500">
+                {kind === 'PULLBACK' ? '回撤 %' : '触发价'}
+              </label>
+              <input
+                type="number"
+                value={value}
+                onChange={e => { setValue(e.target.value); setSource('MANUAL') }}
+                step={kind === 'PULLBACK' ? '0.5' : '0.001'}
+                min="0"
+                placeholder={kind === 'PULLBACK' ? '12' : '0.000'}
+                className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2.5 text-sm text-neutral-100 placeholder-neutral-500 focus:border-amber-500 focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="mb-1.5 block text-xs text-neutral-500">拟买回股数</label>
+              <input
+                type="number"
+                value={shares}
+                onChange={e => setShares(e.target.value)}
+                min="0"
+                placeholder={sellShares || '0'}
+                className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2.5 text-sm text-neutral-100 placeholder-neutral-500 focus:border-amber-500 focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="mb-1.5 block text-xs text-neutral-500">有效期（天）</label>
+              <input
+                type="number"
+                value={validDays}
+                onChange={e => setValidDays(e.target.value)}
+                min="1"
+                placeholder="90"
+                className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2.5 text-sm text-neutral-100 placeholder-neutral-500 focus:border-amber-500 focus:outline-none"
+              />
+            </div>
+          </div>
+
+          {/* 换算回显 —— 让数字的含义当场可见 */}
+          {triggerPrice != null && (
+            <div className="rounded-lg border border-neutral-800 bg-neutral-950/50 p-3 text-sm">
+              <p className="text-neutral-200">
+                触发价 <span className="font-semibold text-amber-300">{fmtPrice(triggerPrice)}</span>
+                {pullbackPct != null && (
+                  <span className="text-neutral-400">
+                    {' '}（自卖出价回撤 {pullbackPct.toFixed(1)}%）
+                  </span>
+                )}
+              </p>
+              {belowNoiseFloor && (
+                <p className="mt-1.5 text-xs text-amber-400/90">
+                  ⚠ 低于 {MIN_PULLBACK_PCT}% 的回调多半是噪音（日波动 2-3% 的标的，
+                  5 日累计波动约 5-6%）。你说过只做大笔买入——确认这个门槛值得出手？
+                </p>
+              )}
+            </div>
+          )}
+
+          {source === 'LLM' && rationale && (
+            <p className="text-xs text-neutral-500">AI 起草理由：{rationale}</p>
+          )}
+          {draftError && <p className="text-xs text-rose-400">{draftError}</p>}
+        </div>
+      )}
+    </div>
+  )
+}
 
 // ── Add-buy (加仓) form ──────────────────────────────────────────────────────
 function AddBuyForm({
@@ -250,6 +570,9 @@ function AddBuyForm({
   const [error, setError] = useState('')
   const [done, setDone] = useState(false)
   const [analysis, setAnalysis] = useState<AddBuyAnalysis | null>(null)
+  const [executedPlans, setExecutedPlans] = useState<Array<{
+    sellRecordId: number; triggerPrice: number; executedFrom: 'ARMED' | 'FIRED'
+  }>>([])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -271,6 +594,7 @@ function AddBuyForm({
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? '加仓失败')
       setAnalysis(data.analysis ?? null)
+      setExecutedPlans(data.executedPlans ?? [])
       setDone(true)
       onDone()
     } catch (e) {
@@ -290,6 +614,17 @@ function AddBuyForm({
             本次加仓与下方分析结论已一并写入「历史记录」。
           </p>
         </div>
+        {executedPlans.length > 0 && (
+          <div className="rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-200">
+            本笔买入已关联为买回计划执行
+            {executedPlans.map(p => (
+              <p key={p.sellRecordId} className="mt-1">
+                {p.executedFrom === 'FIRED' ? '（触发后按计划买回）' : '（未触发即提前买回，偏离声明条件）'} ·
+                触发价 {fmtPrice(p.triggerPrice)}
+              </p>
+            ))}
+          </div>
+        )}
         <AddBuyAnalysisBlock analysis={analysis} />
       </div>
     )
@@ -355,8 +690,21 @@ export default function PositionDetailPage() {
   const [sellReason, setSellReason] = useState('止盈')
   const [sellNote, setSellNote] = useState('')
   const [selling, setSelling] = useState(false)
-  const [sellResult, setSellResult] = useState<{ score: number; comment: string } | null>(null)
+  const [sellResult, setSellResult] = useState<{
+    score: number
+    comment: string
+    plan: ReentryPlan | null
+  } | null>(null)
   const [sellError, setSellError] = useState('')
+
+  // 买回计划（卖出表单内）
+  const [planEnabled, setPlanEnabled] = useState(false)
+  const [planKind, setPlanKind] = useState<'PULLBACK' | 'PRICE'>('PULLBACK')
+  const [planValue, setPlanValue] = useState('')
+  const [planShares, setPlanShares] = useState('')
+  const [planValidDays, setPlanValidDays] = useState('90')
+  const [planSource, setPlanSource] = useState<'LLM' | 'MANUAL'>('MANUAL')
+  const [planRationale, setPlanRationale] = useState('')
 
   const fetchPosition = useCallback(async () => {
     try {
@@ -399,6 +747,18 @@ export default function PositionDetailPage() {
     if (!position || !sellShares || !sellPrice) return
     setSelling(true); setSellError('')
     try {
+      // 买回计划：只有勾选且填了有效数字才随卖出锁定。
+      const planNum = parseFloat(planValue)
+      const reentry =
+        planEnabled && Number.isFinite(planNum) && planNum > 0
+          ? {
+              trigger: { kind: planKind, value: planNum, price: 0 }, // price 由服务端换算锁定
+              shares: parseFloat(planShares) || 0,
+              validDays: parseInt(planValidDays) || undefined,
+              source: planSource,
+            }
+          : undefined
+
       const res = await fetch('/api/sell', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -409,13 +769,20 @@ export default function PositionDetailPage() {
           price: parseFloat(sellPrice),
           reason: sellReason,
           note: sellNote,
+          reentry,
         }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? 'Sell failed')
-      setSellResult({ score: data.consistencyScore, comment: data.consistencyNote })
+      setSellResult({
+        score: data.consistencyScore,
+        comment: data.consistencyNote,
+        plan: data.reentryPlan ?? null,
+      })
       await fetchPosition()
-      if (data.closed) setTimeout(() => router.push('/'), 2500)
+      // 立了买回计划就别急着跳走——确认信息（触发价、有效期）需要被读到。
+      // 没有计划才沿用原来的自动返回。
+      if (data.closed && !data.reentryPlan) setTimeout(() => router.push('/'), 2500)
     } catch (e) {
       setSellError((e as Error).message)
     } finally {
@@ -456,6 +823,33 @@ export default function PositionDetailPage() {
   const pnlColor = (position.realizedPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
   const history = position.history ?? []
 
+  // 已触发待执行的买回计划：整页最高优先级提示。
+  const plansOnPosition = position.sellRecords.map(sr => ({
+    sr,
+    plan: parseReentryPlanJson(sr.reentryPlanJson),
+  }))
+  const firedPlan = plansOnPosition.find(x => x.plan?.status === 'FIRED')
+  const hasActivePlan = plansOnPosition.some(
+    x => x.plan?.status === 'FIRED' || x.plan?.status === 'ARMED'
+  )
+
+  const handleCancelPlan = async (sellRecordId: number) => {
+    try {
+      const res = await fetch('/api/reentry', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sellRecordId }),
+      })
+      if (!res.ok) {
+        const data = await res.json()
+        throw new Error(data.error ?? '取消失败')
+      }
+      await fetchPosition()
+    } catch (e) {
+      setRefreshError((e as Error).message)
+    }
+  }
+
   return (
     <div>
       {/* ── Breadcrumb ── */}
@@ -464,6 +858,41 @@ export default function PositionDetailPage() {
         <span>/</span>
         <span className="text-neutral-200">{position.stock.name}</span>
       </div>
+
+      {/* ── 买回触发横幅（最高优先级）── */}
+      {firedPlan?.plan && (
+        <div className="mb-6 rounded-xl border border-amber-400/50 bg-amber-400/10 p-5">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-amber-300">
+                买回条件已达成 · 待执行
+              </p>
+              <p className="mt-1.5 text-sm leading-relaxed text-neutral-200">
+                {firedPlan.plan.firedNote}
+              </p>
+              <p className="mt-2 text-xs text-neutral-400">
+                声明于 {new Date(firedPlan.plan.soldAt).toLocaleDateString('zh-CN')}：
+                {describeTrigger(firedPlan.plan.trigger, firedPlan.plan.sellPrice)}
+                {firedPlan.plan.shares > 0 && ` · 拟买回 ${firedPlan.plan.shares} 股`}
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-col gap-2">
+              <button
+                onClick={() => setActiveTab('sell')}
+                className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:bg-amber-400 transition-colors"
+              >
+                去记录买回
+              </button>
+              <button
+                onClick={() => handleCancelPlan(firedPlan.sr.id)}
+                className="rounded-lg border border-neutral-700 px-4 py-2 text-xs text-neutral-400 hover:border-neutral-600 hover:text-neutral-200 transition-colors"
+              >
+                放弃该计划
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Header ── */}
       <div className="mb-6 rounded-xl border border-neutral-800 bg-neutral-900 p-6">
@@ -496,7 +925,7 @@ export default function PositionDetailPage() {
                 {VERDICT_LABEL[latestRefresh.verdict]}
               </span>
             )}
-            {position.status === 'OPEN' && (
+            {position.status === 'OPEN' ? (
               <button
                 onClick={handleRefresh}
                 disabled={refreshing}
@@ -504,7 +933,16 @@ export default function PositionDetailPage() {
               >
                 {refreshing ? '分析中…' : '刷新分析'}
               </button>
-            )}
+            ) : hasActivePlan ? (
+              // 已平仓但仍有买回计划：走轻量检查（不跑 LLM，只核价格与论点闸门）
+              <button
+                onClick={handleRefresh}
+                disabled={refreshing}
+                className="rounded-lg border border-amber-400/40 bg-amber-400/10 px-4 py-2 text-sm font-medium text-amber-200 hover:bg-amber-400/20 disabled:opacity-50 transition-colors"
+              >
+                {refreshing ? '检查中…' : '检查买回计划'}
+              </button>
+            ) : null}
           </div>
         </div>
         {refreshError && (
@@ -740,6 +1178,19 @@ export default function PositionDetailPage() {
                 </span>
               </div>
               <p className="text-sm text-neutral-300 leading-relaxed">{sellResult.comment}</p>
+              {sellResult.plan && (
+                <div className="mt-4 rounded-lg border border-amber-400/30 bg-amber-400/10 p-3">
+                  <p className="text-sm font-medium text-amber-300">买回计划已锁定 ✓</p>
+                  <p className="mt-1 text-sm text-neutral-200">
+                    {describeTrigger(sellResult.plan.trigger, sellResult.plan.sellPrice)}
+                  </p>
+                  <p className="mt-1 text-xs text-neutral-400">
+                    有效 {sellResult.plan.validDays} 天
+                    {sellResult.plan.shares > 0 && ` · 拟买回 ${sellResult.plan.shares} 股`}
+                    {' '}· 此后每次刷新自动检查（价格 × 论点双条件），触发时在总览页高亮提醒
+                  </p>
+                </div>
+              )}
               <p className="mt-3 text-xs text-neutral-400">本次卖出、盈亏与该评分已写入「历史记录」。</p>
             </div>
           ) : (
@@ -786,6 +1237,28 @@ export default function PositionDetailPage() {
                   rows={3} placeholder="详细说明卖出原因，有助于一致性评估…"
                   className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-4 py-3 text-sm text-neutral-100 placeholder-neutral-600 focus:border-indigo-500 focus:outline-none" />
               </div>
+
+              <ReentryPlanFields
+                enabled={planEnabled}
+                onToggle={setPlanEnabled}
+                positionId={position.id}
+                sellPrice={sellPrice}
+                sellShares={sellShares}
+                sellReason={sellReason}
+                sellNote={sellNote}
+                kind={planKind}
+                setKind={setPlanKind}
+                value={planValue}
+                setValue={setPlanValue}
+                shares={planShares}
+                setShares={setPlanShares}
+                validDays={planValidDays}
+                setValidDays={setPlanValidDays}
+                source={planSource}
+                setSource={setPlanSource}
+                rationale={planRationale}
+                setRationale={setPlanRationale}
+              />
 
               {sellError && (
                 <p className="text-sm text-rose-400">{sellError}</p>

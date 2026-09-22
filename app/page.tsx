@@ -21,6 +21,12 @@ interface Position {
   lastActionSuggestion?: string
   openedAt: string
   degraded?: boolean
+  reentry?: {
+    status: 'ARMED' | 'FIRED'
+    desc: string
+    firedAt?: string
+    lastCheckNote?: string
+  }
 }
 
 interface PnlSummary {
@@ -31,6 +37,45 @@ interface PnlSummary {
   pnlTotalCNY: number
 }
 
+interface ClosedPosition {
+  id: number
+  symbol: string
+  name: string
+  market: string
+  closedAt?: string
+  openedAt: string
+  realizedPnl?: number
+  lastSoldAt?: string
+  lastSellPnlPct?: number
+  consistencyScore?: number
+  activePlan?: 'ARMED' | 'FIRED'
+}
+
+/** 买回监控行（来自 /api/reentry） */
+interface ReentryRow {
+  sellRecordId: number
+  positionId: number
+  positionStatus: string
+  symbol: string
+  name: string
+  market: string
+  soldAt: string
+  soldPrice: number
+  soldShares: number
+  plan: {
+    status: 'ARMED' | 'FIRED' | 'EXPIRED' | 'CANCELLED' | 'EXECUTED'
+    trigger: { kind: string; value: number; price: number }
+    shares: number
+    validDays: number
+    soldAt: string
+    firedAt?: string
+  }
+  planDesc: string
+  currentPrice?: number
+  gapPct?: number
+  lastCheckNote?: string | null
+}
+
 interface RefreshResult {
   positionId: number
   symbol?: string
@@ -38,6 +83,8 @@ interface RefreshResult {
   status: string
   verdict?: string
   error?: string
+  monitoring?: boolean
+  reentry?: { fired: boolean; note: string; triggerPrice?: number }
 }
 
 const VERDICT_COLOR: Record<string, string> = {
@@ -54,6 +101,9 @@ const VERDICT_LABEL: Record<string, string> = {
 
 export default function HomePage() {
   const [positions, setPositions] = useState<Position[]>([])
+  const [closedPositions, setClosedPositions] = useState<ClosedPosition[]>([])
+  const [reentryRows, setReentryRows] = useState<ReentryRow[]>([])
+  const [showClosed, setShowClosed] = useState(false)
   const [pnlSummary, setPnlSummary] = useState<PnlSummary | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -62,12 +112,22 @@ export default function HomePage() {
 
   const fetchPositions = useCallback(async () => {
     try {
-      const res = await fetch('/api/positions')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
+      // 买回计划与持仓并列拉取：计划挂在卖出上，已平仓的股票不在持仓列表里，
+      // 但它仍是「在跟踪的决策」——必须常驻可见，不能只在刷新后闪现。
+      const [posRes, reentryRes] = await Promise.all([
+        fetch('/api/positions'),
+        fetch('/api/reentry'),
+      ])
+      if (!posRes.ok) throw new Error(`HTTP ${posRes.status}`)
+      const data = await posRes.json()
       setError(null)
       setPositions(data.positions ?? [])
+      setClosedPositions(data.closedPositions ?? [])
       setPnlSummary(data.pnlSummary ?? null)
+      if (reentryRes.ok) {
+        const rd = await reentryRes.json()
+        setReentryRows(rd.plans ?? [])
+      }
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -118,6 +178,11 @@ export default function HomePage() {
   const openCount = positions.length
   const brokenCount = positions.filter(p => p.lastVerdict === 'BROKEN').length
   const totalPnl = positions.reduce((s, p) => s + (p.unrealizedPnl ?? 0), 0)
+  // 仍在跟踪的买回计划（含已平仓股票）——这是常驻数据，不依赖刷新
+  const activePlans = reentryRows.filter(
+    r => r.plan.status === 'ARMED' || r.plan.status === 'FIRED'
+  )
+  const firedCount = activePlans.filter(r => r.plan.status === 'FIRED').length
 
   return (
     <div>
@@ -129,6 +194,12 @@ export default function HomePage() {
             {openCount} 只持仓
             {brokenCount > 0 && (
               <span className="ml-2 text-rose-400">{brokenCount} 只逻辑已破坏</span>
+            )}
+            {activePlans.length > 0 && (
+              <span className="ml-2 text-amber-400">
+                {activePlans.length} 个买回计划
+                {firedCount > 0 && `（${firedCount} 个已触发）`}
+              </span>
             )}
           </p>
         </div>
@@ -199,6 +270,99 @@ export default function HomePage() {
         </div>
       )}
 
+      {/* ── 买回监控（常驻）──────────────────────────────────────────
+          计划挂在卖出上，清仓后的股票不在持仓列表里，但承诺仍然活着。
+          这里是它唯一的常驻可见面——FIRED 置顶高亮，不点刷新也看得到。 */}
+      {activePlans.length > 0 && (
+        <div className="mb-6">
+          <div className="mb-2 flex items-baseline gap-2">
+            <h2 className="text-sm font-medium text-neutral-300">买回监控</h2>
+            <span className="text-xs text-neutral-500">{activePlans.length} 个计划</span>
+            {firedCount > 0 && (
+              <span className="text-xs text-amber-400">{firedCount} 个已触发待执行</span>
+            )}
+          </div>
+          <div className="space-y-2">
+            {activePlans.map(r => {
+              const fired = r.plan.status === 'FIRED'
+              return (
+                <div
+                  key={r.sellRecordId}
+                  className={`rounded-xl border p-4 transition-colors ${
+                    fired
+                      ? 'border-amber-400/50 bg-amber-400/10'
+                      : 'border-neutral-800 bg-neutral-900 hover:border-neutral-700'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Link
+                          href={`/position/${r.positionId}`}
+                          className="font-medium text-neutral-100 hover:text-white"
+                        >
+                          {r.name}
+                        </Link>
+                        <span className="text-xs text-neutral-500">{r.symbol}</span>
+                        <span
+                          className={`rounded-full border px-2 py-0.5 text-xs font-medium ${
+                            fired
+                              ? 'border-amber-400/40 bg-amber-400/15 text-amber-200'
+                              : 'border-amber-400/20 bg-amber-400/5 text-amber-400/80'
+                          }`}
+                        >
+                          {fired ? '⚑ 已触发 · 待执行' : '◷ 监控中'}
+                        </span>
+                        {r.positionStatus === 'CLOSED' && (
+                          <span className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-500">
+                            已清仓
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1.5 text-sm text-neutral-300">{r.planDesc}</p>
+                      {fired ? (
+                        <p className="mt-1.5 text-sm leading-relaxed text-neutral-200">
+                          {r.lastCheckNote}
+                        </p>
+                      ) : (
+                        <p className="mt-1 text-xs text-neutral-500">
+                          {r.currentPrice != null ? (
+                            <>
+                              现价 {fmtPrice(r.currentPrice)}
+                              {r.gapPct != null && (
+                                <span className="text-neutral-400">
+                                  {r.gapPct > 0
+                                    ? ` · 距触发还需下跌 ${r.gapPct.toFixed(1)}%`
+                                    : ` · 已低于触发价 ${Math.abs(r.gapPct).toFixed(1)}%（论点闸门未放行）`}
+                                </span>
+                              )}
+                            </>
+                          ) : (
+                            '价格获取中…'
+                          )}
+                          {' · '}声明于 {new Date(r.plan.soldAt).toLocaleDateString('zh-CN')}
+                          {' · 有效 '}{r.plan.validDays} 天
+                        </p>
+                      )}
+                    </div>
+                    <Link
+                      href={`/position/${r.positionId}`}
+                      className={`shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                        fired
+                          ? 'bg-amber-500 text-neutral-950 hover:bg-amber-400'
+                          : 'border border-neutral-700 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                      }`}
+                    >
+                      {fired ? '去处理' : '详情'}
+                    </Link>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
       {/* ── Refresh progress ── */}
       {refreshProgress.length > 0 && (
         <div className="mb-6 rounded-xl border border-neutral-800 bg-neutral-900 p-4">
@@ -206,11 +370,23 @@ export default function HomePage() {
           <div className="space-y-2">
             {refreshProgress.map(r => (
               <div key={r.positionId} className="flex items-center justify-between text-sm">
-                <span className="text-neutral-300">{r.name ?? `#${r.positionId}`}</span>
+                <span className="text-neutral-300">
+                  {r.name ?? `#${r.positionId}`}
+                  {r.monitoring && (
+                    <span className="ml-1.5 text-xs text-neutral-600">仅买回监控</span>
+                  )}
+                  {r.reentry?.fired && (
+                    <span className="ml-1.5 text-xs text-amber-400">⚑ 买回触发</span>
+                  )}
+                </span>
                 {r.status === 'ok' ? (
-                  <span className={`rounded-full border px-2 py-0.5 text-xs ${VERDICT_COLOR[r.verdict ?? 'SUPPORT']}`}>
-                    {VERDICT_LABEL[r.verdict ?? 'SUPPORT']}
-                  </span>
+                  r.monitoring ? (
+                    <span className="text-xs text-neutral-500">已检查</span>
+                  ) : (
+                    <span className={`rounded-full border px-2 py-0.5 text-xs ${VERDICT_COLOR[r.verdict ?? 'SUPPORT']}`}>
+                      {VERDICT_LABEL[r.verdict ?? 'SUPPORT']}
+                    </span>
+                  )
                 ) : r.status === 'error' ? (
                   <span className="text-xs text-rose-400">失败: {r.error?.slice(0, 60)}</span>
                 ) : (
@@ -321,6 +497,20 @@ export default function HomePage() {
                         {VERDICT_LABEL[pos.lastVerdict]}
                       </span>
                     )}
+
+                    {/* 买回计划徽章 */}
+                    {pos.reentry && (
+                      <span
+                        title={pos.reentry.lastCheckNote ?? pos.reentry.desc}
+                        className={`rounded-full border px-2.5 py-1 text-xs font-medium ${
+                          pos.reentry.status === 'FIRED'
+                            ? 'border-amber-400/40 bg-amber-400/15 text-amber-200'
+                            : 'border-amber-400/20 bg-amber-400/5 text-amber-400/80'
+                        }`}
+                      >
+                        {pos.reentry.status === 'FIRED' ? '⚑ 买回已触发' : '◷ 买回监控中'}
+                      </span>
+                    )}
                   </div>
                 </div>
 
@@ -359,6 +549,106 @@ export default function HomePage() {
               </div>
             )
           })}
+        </div>
+      )}
+
+      {/* ── 已平仓（复盘入口）──────────────────────────────────────────
+          全量卖出的持仓此前在前端完全不可达，历史记录与一致性评分等于
+          写进去就看不见。这里是它的入口，默认折叠——是复盘用的，不是每天看的。 */}
+      {!loading && closedPositions.length > 0 && (
+        <div className="mt-8">
+          <button
+            onClick={() => setShowClosed(v => !v)}
+            className="flex w-full items-center gap-2 border-t border-neutral-800 pt-4 text-left text-sm text-neutral-500 hover:text-neutral-300 transition-colors"
+          >
+            <span className={`text-xs transition-transform ${showClosed ? 'rotate-90' : ''}`}>▶</span>
+            已平仓 ({closedPositions.length})
+            {closedPositions.some(c => c.activePlan) && (
+              <span className="text-xs text-amber-400/80">· 含买回监控</span>
+            )}
+          </button>
+
+          {showClosed && (
+            <div className="mt-3 space-y-2">
+              {closedPositions.map(c => {
+                const pnl = c.realizedPnl ?? 0
+                const pnlPos = pnl >= 0
+                // 持有天数只在两端日期都有时计算——不用 Date.now() 兜底（渲染期纯函数）
+                const endDate = c.lastSoldAt ?? c.closedAt
+                const heldDays =
+                  endDate && c.openedAt
+                    ? Math.max(
+                        1,
+                        Math.round(
+                          (new Date(endDate).getTime() - new Date(c.openedAt).getTime()) / 86400000
+                        )
+                      )
+                    : null
+                return (
+                  <div
+                    key={c.id}
+                    className="rounded-xl border border-neutral-800/70 bg-neutral-900/50 p-4"
+                  >                    <div className="flex items-start justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Link
+                            href={`/position/${c.id}`}
+                            className="font-medium text-neutral-300 hover:text-neutral-100"
+                          >
+                            {c.name}
+                          </Link>
+                          <span className="text-xs text-neutral-600">{c.symbol}</span>
+                          {c.activePlan && (
+                            <span
+                              className={`rounded-full border px-2 py-0.5 text-xs ${
+                                c.activePlan === 'FIRED'
+                                  ? 'border-amber-400/40 bg-amber-400/15 text-amber-200'
+                                  : 'border-amber-400/20 bg-amber-400/5 text-amber-400/80'
+                              }`}
+                            >
+                              {c.activePlan === 'FIRED' ? '⚑ 买回已触发' : '◷ 买回监控中'}
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-1 text-xs text-neutral-500">
+                          {c.lastSoldAt && `${new Date(c.lastSoldAt).toLocaleDateString('zh-CN')} 平仓`}
+                          {heldDays != null && ` · 持有 ${heldDays} 天`}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-4">
+                        <div className="text-right">
+                          <p className={`text-sm font-semibold ${pnlPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {pnlPos ? '+' : ''}{pnl.toFixed(0)} {c.market === 'US' ? 'USD' : 'CNY'}
+                          </p>
+                          {c.lastSellPnlPct != null && (
+                            <p className={`text-xs ${pnlPos ? 'text-emerald-500' : 'text-rose-500'}`}>
+                              {c.lastSellPnlPct >= 0 ? '+' : ''}{c.lastSellPnlPct.toFixed(2)}%
+                            </p>
+                          )}
+                        </div>
+                        {c.consistencyScore != null && (
+                          <div className="text-right">
+                            <p className="text-xs text-neutral-600">一致性</p>
+                            <p className={`text-sm font-semibold ${
+                              c.consistencyScore >= 70 ? 'text-emerald-400' : 'text-amber-400'
+                            }`}>
+                              {c.consistencyScore}
+                            </p>
+                          </div>
+                        )}
+                        <Link
+                          href={`/position/${c.id}`}
+                          className="rounded-lg border border-neutral-700 px-3 py-1 text-xs text-neutral-400 hover:border-neutral-600 hover:text-neutral-200 transition-colors"
+                        >
+                          历史
+                        </Link>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -82,6 +82,39 @@ export interface ThesisPoint {
   trend?: '恶化' | '持平' | '改善'
 }
 
+// ─── Re-entry Plan (买回计划，v0.3) ──────────────────────────────────────────
+// 完整类型与状态机见 lib/reentry.ts；此处仅声明展示层所需的形状。
+
+export interface ReentryTrigger {
+  kind: 'PULLBACK' | 'PRICE'
+  value: number
+  price: number
+}
+
+export interface ReentryPlan {
+  status: 'ARMED' | 'FIRED' | 'EXPIRED' | 'CANCELLED' | 'EXECUTED'
+  trigger: ReentryTrigger
+  sellPrice: number
+  shares: number
+  validDays: number
+  source: 'LLM' | 'MANUAL'
+  createdAt: string
+  soldAt: string
+  lastCheckedAt?: string
+  lastLow?: number | null
+  lastPrice?: number | null
+  lastNote?: string
+  firedAt?: string
+  firedNote?: string
+  firedLow?: number
+  expiredAt?: string
+  cancelledAt?: string
+  executedAt?: string
+  executedBuyRecordId?: number
+  executedPositionId?: number
+  executedFrom?: 'ARMED' | 'FIRED'
+}
+
 // ─── LLM Analysis Output ─────────────────────────────────────────────────────
 
 export interface AnalysisResult {
@@ -100,7 +133,7 @@ export interface AnalysisResult {
 
 // ─── History Timeline (历史记录) ──────────────────────────────────────────────
 
-export type HistoryEventType = 'BUY' | 'ADD_BUY' | 'REFRESH' | 'SELL'
+export type HistoryEventType = 'BUY' | 'ADD_BUY' | 'REFRESH' | 'SELL' | 'REENTRY'
 
 /** 加仓时定格的刷新结论——加仓不另跑 LLM，沿用当时最近一次刷新分析。 */
 export interface AddBuyAnalysis {
@@ -147,9 +180,18 @@ export interface SellEvent extends HistoryEventBase {
   pnlPct: number | null
   consistencyScore: number | null
   consistencyNote: string | null
+  reentryPlan: ReentryPlan | null
 }
 
-export type HistoryEvent = BuyEvent | RefreshEvent | SellEvent
+export type HistoryEvent = BuyEvent | RefreshEvent | SellEvent | ReentryEvent
+
+/** 买回计划状态变化事件（触发/执行/过期/取消），驱动时间线上的 REENTRY 节点。 */
+export interface ReentryEvent extends HistoryEventBase {
+  type: 'REENTRY'
+  kind: 'FIRED' | 'EXECUTED' | 'EXPIRED' | 'CANCELLED'
+  plan: ReentryPlan
+  sellRecordId: number
+}
 
 // ─── API Response Types ───────────────────────────────────────────────────────
 
@@ -168,6 +210,12 @@ export interface PositionSummary {
   lastVerdict?: Verdict
   lastRefreshedAt?: string
   lastActionSuggestion?: string
+  reentry?: {
+    status: 'ARMED' | 'FIRED'
+    desc: string
+    firedAt?: string
+    lastCheckNote?: string
+  }
   openedAt: string
 }
 

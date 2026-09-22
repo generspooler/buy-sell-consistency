@@ -3,33 +3,80 @@ import { prisma } from '@/lib/db'
 import { MarketDataService } from '@/lib/market-data'
 import { analyzePosition } from '@/lib/llm-analyzer'
 import { Market, StockSnapshot, ThesisPoint } from '@/lib/types'
+import {
+  parseReentryPlan,
+  runReentryCheck,
+  serializeReentryPlan,
+  ReentryPlan,
+} from '@/lib/reentry'
 
 const marketDataService = new MarketDataService()
 
-// POST /api/refresh — refresh one or all positions
+interface ReentryOutcome {
+  fired: boolean
+  note: string
+  triggerPrice: number
+}
+
+/** 单只持仓的刷新结果行（分析结果 + 可选的买回触发）。 */
+interface RefreshResultRow {
+  positionId: number
+  symbol?: string
+  name?: string
+  status: 'ok' | 'skipped' | 'error'
+  reason?: string
+  verdict?: string
+  actionSuggestion?: string
+  error?: string
+  /** 仅做买回计划监控（已平仓），未跑 LLM 分析。 */
+  monitoring?: boolean
+  reentry?: ReentryOutcome
+}
+
+// POST /api/refresh — refresh one or all positions, then mechanically check
+// every ARMED re-entry plan (price gate × thesis gate, pure arithmetic — no
+// LLM involved in the trigger decision).
+//
+// Plan checks run AFTER all analyses, keyed by stock (a plan hangs on a sell,
+// not on a position's OPEN status):
+//   - stocks with an OPEN position: checked with the fresh verdict from this
+//     refresh (plans on closed positions of the same stock ride along);
+//   - stocks with no open position: lightweight check only — live price +
+//     cached candles + the stock's last known verdict. No LLM, no RefreshLog.
 export async function POST(req: NextRequest) {
   const body = await req.json()
   const { positionId } = body as { positionId?: number }
 
-  const where = positionId
-    ? { id: positionId, status: 'OPEN' }
-    : { status: 'OPEN' }
+  // ── 目标选择 ────────────────────────────────────────────────────────────
+  const explicitPosition = positionId
+    ? await prisma.position.findUnique({ where: { id: positionId }, include: { stock: true } })
+    : null
 
-  const positions = await prisma.position.findMany({
-    where,
-    include: {
-      stock: true,
-      buyRecords: { orderBy: { boughtAt: 'asc' }, take: 1 },
-      refreshLogs: { orderBy: { refreshedAt: 'desc' }, take: 1 },
-    },
-  })
-
-  if (positions.length === 0) {
-    return NextResponse.json({ results: [] })
+  if (explicitPosition && explicitPosition.status !== 'OPEN') {
+    // 刷新已平仓持仓 = 只做买回计划监控，不跑分析。
+    const { checked, fired } = await lightCheckStock(explicitPosition.stockId)
+    const row: RefreshResultRow = {
+      positionId: explicitPosition.id,
+      symbol: explicitPosition.stock.symbol,
+      name: explicitPosition.stock.name,
+      status: checked > 0 ? 'ok' : 'skipped',
+      reason: checked > 0 ? undefined : '已平仓且无监控中的买回计划',
+      monitoring: true,
+      reentry: fired ?? undefined,
+    }
+    return NextResponse.json({ results: [row] })
   }
 
-  const results = await Promise.all(
-    positions.map(async (pos) => {
+  const openTargets = await loadOpenPositions(positionId)
+
+  // ── Phase 1: 分析（LLM），与原流水线一致 ────────────────────────────────
+  const analyses = new Map<
+    number /* stockId */,
+    { snapshot: StockSnapshot; verdict: string; symbol: string; market: Market }
+  >()
+
+  const results: RefreshResultRow[] = await Promise.all(
+    openTargets.map(async (pos): Promise<RefreshResultRow> => {
       try {
         if (pos.buyRecords.length === 0) {
           return { positionId: pos.id, status: 'skipped', reason: 'No buy records' }
@@ -39,13 +86,11 @@ export async function POST(req: NextRequest) {
         const buySnapshot: StockSnapshot = JSON.parse(firstBuy.snapshotJson || '{}')
         const thesisPoints: ThesisPoint[] = JSON.parse(firstBuy.thesisPointsJson || '[]')
 
-        // Fetch latest snapshot
         const currentSnapshot = await marketDataService.buildSnapshot(
           pos.stock.symbol,
           pos.stock.market as Market
         )
 
-        // Previous refresh snapshot for comparison
         let lastSnapshot: StockSnapshot | undefined
         if (pos.refreshLogs[0]?.snapshotJson) {
           try {
@@ -53,7 +98,6 @@ export async function POST(req: NextRequest) {
           } catch {}
         }
 
-        // Run LLM analysis
         const analysis = await analyzePosition(
           pos.stock.name,
           pos.stock.market as Market,
@@ -64,7 +108,6 @@ export async function POST(req: NextRequest) {
           lastSnapshot
         )
 
-        // Persist refresh log
         await prisma.refreshLog.create({
           data: {
             positionId: pos.id,
@@ -72,6 +115,13 @@ export async function POST(req: NextRequest) {
             analysisJson: JSON.stringify(analysis),
             verdict: analysis.verdict,
           },
+        })
+
+        analyses.set(pos.stockId, {
+          snapshot: currentSnapshot,
+          verdict: analysis.verdict,
+          symbol: pos.stock.symbol,
+          market: pos.stock.market as Market,
         })
 
         return {
@@ -95,5 +145,139 @@ export async function POST(req: NextRequest) {
     })
   )
 
+  // ── Phase 2: 买回计划检查（纯算术，串行免竞态）─────────────────────────
+  const firedByStock = new Map<number, ReentryOutcome>()
+
+  for (const [stockId, ctx] of analyses) {
+    const { fired } = await checkPlansForStock(
+      stockId,
+      ctx.symbol,
+      ctx.market,
+      ctx.snapshot,
+      ctx.verdict
+    )
+    if (fired) firedByStock.set(stockId, fired)
+  }
+
+  // 轻量监控：仍有 ARMED 计划、但本轮没有被任何 OPEN 持仓覆盖的股票
+  // （典型场景：清仓后等回调）。
+  if (!positionId) {
+    const covered = new Set(analyses.keys())
+    const closedWithPlans = await prisma.position.findMany({
+      where: {
+        status: 'CLOSED',
+        sellRecords: { some: { reentryPlanJson: { contains: '"status":"ARMED"' } } },
+      },
+      include: { stock: true },
+    })
+    const seen = new Set<number>()
+    for (const pos of closedWithPlans) {
+      if (covered.has(pos.stockId) || seen.has(pos.stockId)) continue
+      seen.add(pos.stockId)
+      const { checked, fired } = await lightCheckStock(pos.stockId)
+      if (checked > 0) {
+        results.push({
+          positionId: pos.id,
+          symbol: pos.stock.symbol,
+          name: pos.stock.name,
+          status: 'ok',
+          monitoring: true,
+          reentry: fired ?? undefined,
+        })
+      }
+    }
+  }
+
+  // 把触发结果挂到对应持仓的结果行上（按股票对应）。轻量监控行已自带
+  // reentry 且不在 openTargets 中，不会被覆盖。
+  const stockIdByPosition = new Map(openTargets.map(p => [p.id, p.stockId]))
+  for (const r of results) {
+    const stockId = stockIdByPosition.get(r.positionId)
+    const outcome = stockId != null ? firedByStock.get(stockId) : undefined
+    if (outcome?.fired) r.reentry = outcome
+  }
+
   return NextResponse.json({ results })
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+async function loadOpenPositions(positionId?: number) {
+  return prisma.position.findMany({
+    where: positionId ? { id: positionId, status: 'OPEN' } : { status: 'OPEN' },
+    include: {
+      stock: true,
+      buyRecords: { orderBy: { boughtAt: 'asc' }, take: 1 },
+      refreshLogs: { orderBy: { refreshedAt: 'desc' }, take: 1 },
+    },
+  })
+}
+
+/**
+ * 检查某股票全部 ARMED 计划（含挂在已平仓持仓上的），逐个落库。
+ * 纯算术判定，snapshot / verdict 由调用方提供——这是「检查」唯一的入口。
+ */
+async function checkPlansForStock(
+  stockId: number,
+  symbol: string,
+  market: Market,
+  snapshot: StockSnapshot,
+  verdict: string | undefined
+): Promise<{ checked: number; fired: ReentryOutcome | null }> {
+  const sells = await prisma.sellRecord.findMany({
+    where: { position: { stockId } },
+    orderBy: { soldAt: 'desc' },
+  })
+  const armed = sells
+    .map(sr => ({ sr, plan: parseReentryPlan(sr.reentryPlanJson) }))
+    .filter(x => x.plan?.status === 'ARMED')
+  if (armed.length === 0) return { checked: 0, fired: null }
+
+  const candles = await marketDataService.getCandles(symbol, market)
+  let firstFired: ReentryOutcome | null = null
+  for (const { sr, plan } of armed) {
+    const { plan: next, fired, note } = runReentryCheck(
+      plan as ReentryPlan,
+      snapshot,
+      candles,
+      null, // 论点闸门用下面的 verdict（本轮最新，或该股最近已知）
+      verdict
+    )
+    await prisma.sellRecord.update({
+      where: { id: sr.id },
+      data: { reentryPlanJson: serializeReentryPlan(next) },
+    })
+    if (fired && !firstFired) {
+      firstFired = { fired, note, triggerPrice: next.trigger.price }
+    }
+  }
+  return { checked: armed.length, fired: firstFired }
+}
+
+/**
+ * 无持仓股票的轻量监控：自行取快照与该股最近一次已知 verdict，然后走同一
+ * 检查函数。不跑 LLM，不写 RefreshLog——「清仓等回调」的监控成本接近零。
+ */
+async function lightCheckStock(
+  stockId: number
+): Promise<{ checked: number; fired: ReentryOutcome | null }> {
+  const stock = await prisma.stock.findUnique({ where: { id: stockId } })
+  if (!stock) return { checked: 0, fired: null }
+
+  const lastLog = await prisma.refreshLog.findFirst({
+    where: { position: { stockId } },
+    orderBy: { refreshedAt: 'desc' },
+    select: { verdict: true },
+  })
+  const snapshot = await marketDataService.buildSnapshot(
+    stock.symbol,
+    stock.market as Market
+  )
+  return checkPlansForStock(
+    stockId,
+    stock.symbol,
+    stock.market as Market,
+    snapshot,
+    lastLog?.verdict
+  )
 }

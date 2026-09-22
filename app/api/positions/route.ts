@@ -3,10 +3,13 @@ import { prisma } from '@/lib/db'
 import { MarketDataService } from '@/lib/market-data'
 import { getUsdCny } from '@/lib/fx'
 import { Market } from '@/lib/types'
+import { parseReentryPlan, describeTrigger } from '@/lib/reentry'
 
 const marketDataService = new MarketDataService()
 
-// GET /api/positions — list all open positions with latest price
+// GET /api/positions — list all open positions with latest price.
+// Each row also carries its re-entry plan state (ARMED/FIRED) for the
+// home-page badges; terminal states stay in the position's history timeline.
 export async function GET() {
   const positions = await prisma.position.findMany({
     where: { status: 'OPEN' },
@@ -14,6 +17,7 @@ export async function GET() {
       stock: true,
       buyRecords: { orderBy: { boughtAt: 'asc' } },
       refreshLogs: { orderBy: { refreshedAt: 'desc' }, take: 1 },
+      sellRecords: { orderBy: { soldAt: 'desc' } },
     },
     orderBy: { openedAt: 'desc' },
   })
@@ -46,6 +50,28 @@ export async function GET() {
         } catch {}
       }
 
+      // 买回计划状态：FIRED = 触发待执行（醒目提醒）；ARMED = 监控中。
+      // 只看本持仓的卖出记录；已平仓持仓的计划在 /api/reentry 单独呈现。
+      let reentry: {
+        status: 'ARMED' | 'FIRED'
+        desc: string
+        firedAt?: string
+        lastCheckNote?: string
+      } | undefined
+      for (const sr of pos.sellRecords) {
+        const plan = parseReentryPlan(sr.reentryPlanJson)
+        if (!plan) continue
+        if (plan.status === 'FIRED' || plan.status === 'ARMED') {
+          reentry = {
+            status: plan.status,
+            desc: describeTrigger(plan.trigger, plan.sellPrice),
+            firedAt: plan.firedAt,
+            lastCheckNote: plan.firedNote ?? plan.lastNote,
+          }
+          if (plan.status === 'FIRED') break // FIRED 优先展示
+        }
+      }
+
       const unrealizedPnl =
         currentPrice != null
           ? (currentPrice - pos.avgCost) * pos.totalShares
@@ -71,6 +97,7 @@ export async function GET() {
         lastVerdict,
         lastRefreshedAt: lastRefresh?.refreshedAt,
         lastActionSuggestion,
+        reentry,
         openedAt: pos.openedAt,
         degraded,
       }
@@ -96,8 +123,44 @@ export async function GET() {
   const pnlUS = sum('US')
   const pnlTotalCNY = pnlCN + pnlUS * usdCny
 
+  // 已平仓持仓：复盘入口。不取实时行情——平仓后没有浮盈可言，
+  // 需要的是「当时赚了多少、那次卖得一致不一致」，全部来自已落库的值。
+  const closedRaw = await prisma.position.findMany({
+    where: { status: 'CLOSED' },
+    include: {
+      stock: true,
+      sellRecords: { orderBy: { soldAt: 'desc' } },
+    },
+    orderBy: { closedAt: 'desc' },
+  })
+
+  const closedPositions = closedRaw.map(pos => {
+    const lastSell = pos.sellRecords[0]
+    // 该持仓上是否还有活着的买回计划（决定列表里要不要标监控中）
+    let activePlan: 'ARMED' | 'FIRED' | undefined
+    for (const sr of pos.sellRecords) {
+      const plan = parseReentryPlan(sr.reentryPlanJson)
+      if (plan?.status === 'FIRED') { activePlan = 'FIRED'; break }
+      if (plan?.status === 'ARMED') activePlan = 'ARMED'
+    }
+    return {
+      id: pos.id,
+      symbol: pos.stock.symbol,
+      name: pos.stock.name,
+      market: pos.stock.market,
+      closedAt: pos.closedAt,
+      openedAt: pos.openedAt,
+      realizedPnl: pos.realizedPnl,
+      lastSoldAt: lastSell?.soldAt,
+      lastSellPnlPct: lastSell?.pnlPct,
+      consistencyScore: lastSell?.consistencyScore,
+      activePlan,
+    }
+  })
+
   return NextResponse.json({
     positions: results,
+    closedPositions,
     pnlSummary: {
       usdCny,
       fxSource,
