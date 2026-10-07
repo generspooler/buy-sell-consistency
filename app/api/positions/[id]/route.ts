@@ -11,6 +11,20 @@ import {
   Verdict,
 } from '@/lib/types'
 import { parseReentryPlan } from '@/lib/reentry'
+import { MarketDataService } from '@/lib/market-data'
+import { expirySettlement, isExpired, optionContextOf } from '@/lib/options'
+
+const marketDataService = new MarketDataService()
+
+/** 到期待结算的建议（纯算术）：以到期日 K 线收盘价判定价内 / 价外。 */
+interface SettlementSuggestion {
+  expiry: string
+  underlyingClose: number | null
+  /** EXPIRY_CANDLE = 到期日收盘价；LAST_CANDLE = 到期日 K 线缺失，取到期前最后一根 */
+  basis: 'EXPIRY_CANDLE' | 'LAST_CANDLE' | 'NONE'
+  outcome: 'WORTHLESS' | 'ITM' | null
+  intrinsic: number | null
+}
 
 function parseJson<T>(raw: string | null | undefined, fallback: T): T {
   if (!raw) return fallback
@@ -132,5 +146,26 @@ export async function GET(
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
-  return NextResponse.json({ ...position, history: buildHistory(position) })
+  // 已过到期时点仍 OPEN 的期权：给出结算建议，用户确认后走平仓流程。
+  // V1 只把「价外 → 到期作废」做成一键；价内需按券商实际结算手工记录。
+  let settlement: SettlementSuggestion | null = null
+  const optionCtx = optionContextOf(position, position.stock.symbol)
+  if (position.status === 'OPEN' && optionCtx && isExpired(optionCtx.expiry)) {
+    const candles = await marketDataService.getCandles(position.stock.symbol, 'US')
+    const onOrBefore = candles.filter(c => (c.date ?? '').slice(0, 10) <= optionCtx.expiry)
+    const last = onOrBefore[onOrBefore.length - 1]
+    const basis = !last
+      ? 'NONE'
+      : last.date.slice(0, 10) === optionCtx.expiry ? 'EXPIRY_CANDLE' : 'LAST_CANDLE'
+    const verdict = last ? expirySettlement(optionCtx.optionType, optionCtx.strike, last.close) : null
+    settlement = {
+      expiry: optionCtx.expiry,
+      underlyingClose: last?.close ?? null,
+      basis,
+      outcome: verdict?.outcome ?? null,
+      intrinsic: verdict?.intrinsic ?? null,
+    }
+  }
+
+  return NextResponse.json({ ...position, history: buildHistory(position), settlement })
 }

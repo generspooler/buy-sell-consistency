@@ -3,6 +3,7 @@ import { prisma } from '@/lib/db'
 import { MarketDataService } from '@/lib/market-data'
 import { analyzePosition } from '@/lib/llm-analyzer'
 import { Market, StockSnapshot, ThesisPoint } from '@/lib/types'
+import { isExpired, optionContextOf } from '@/lib/options'
 import {
   parseReentryPlan,
   runReentryCheck,
@@ -30,6 +31,8 @@ interface RefreshResultRow {
   error?: string
   /** 仅做买回计划监控（已平仓），未跑 LLM 分析。 */
   monitoring?: boolean
+  /** 期权已过到期时点、待结算——跳过分析。 */
+  expired?: boolean
   reentry?: ReentryOutcome
 }
 
@@ -43,6 +46,10 @@ interface RefreshResultRow {
 //     refresh (plans on closed positions of the same stock ride along);
 //   - stocks with no open position: lightweight check only — live price +
 //     cached candles + the stock's last known verdict. No LLM, no RefreshLog.
+//
+// Option positions (v0.4) analyse the contract against its own thesis
+// (underlying snapshot + option block), are skipped once expired (待结算),
+// and never feed the re-entry gate — that gate reads the STOCK thesis only.
 export async function POST(req: NextRequest) {
   const body = await req.json()
   const { positionId } = body as { positionId?: number }
@@ -82,14 +89,25 @@ export async function POST(req: NextRequest) {
           return { positionId: pos.id, status: 'skipped', reason: 'No buy records' }
         }
 
+        const optionCtx = optionContextOf(pos, pos.stock.symbol)
+        if (optionCtx && isExpired(optionCtx.expiry)) {
+          return {
+            positionId: pos.id,
+            symbol: pos.stock.symbol,
+            name: pos.stock.name,
+            status: 'skipped',
+            reason: '期权已到期，待结算',
+            expired: true,
+          }
+        }
+
         const firstBuy = pos.buyRecords[0]
         const buySnapshot: StockSnapshot = JSON.parse(firstBuy.snapshotJson || '{}')
         const thesisPoints: ThesisPoint[] = JSON.parse(firstBuy.thesisPointsJson || '[]')
 
-        const currentSnapshot = await marketDataService.buildSnapshot(
-          pos.stock.symbol,
-          pos.stock.market as Market
-        )
+        const currentSnapshot = optionCtx
+          ? await marketDataService.buildOptionSnapshot(optionCtx, optionCtx.premium)
+          : await marketDataService.buildSnapshot(pos.stock.symbol, pos.stock.market as Market)
 
         let lastSnapshot: StockSnapshot | undefined
         if (pos.refreshLogs[0]?.snapshotJson) {
@@ -105,7 +123,8 @@ export async function POST(req: NextRequest) {
           thesisPoints,
           buySnapshot,
           currentSnapshot,
-          lastSnapshot
+          lastSnapshot,
+          optionCtx
         )
 
         await prisma.refreshLog.create({
@@ -117,12 +136,15 @@ export async function POST(req: NextRequest) {
           },
         })
 
-        analyses.set(pos.stockId, {
-          snapshot: currentSnapshot,
-          verdict: analysis.verdict,
-          symbol: pos.stock.symbol,
-          market: pos.stock.market as Market,
-        })
+        // 买回闸门只认正股论点：期权的 verdict 评的是合约，不是这只股票。
+        if (!optionCtx) {
+          analyses.set(pos.stockId, {
+            snapshot: currentSnapshot,
+            verdict: analysis.verdict,
+            symbol: pos.stock.symbol,
+            market: pos.stock.market as Market,
+          })
+        }
 
         return {
           positionId: pos.id,
@@ -166,6 +188,7 @@ export async function POST(req: NextRequest) {
     const closedWithPlans = await prisma.position.findMany({
       where: {
         status: 'CLOSED',
+        assetType: 'STOCK',
         sellRecords: { some: { reentryPlanJson: { contains: '"status":"ARMED"' } } },
       },
       include: { stock: true },
@@ -225,7 +248,7 @@ async function checkPlansForStock(
   verdict: string | undefined
 ): Promise<{ checked: number; fired: ReentryOutcome | null }> {
   const sells = await prisma.sellRecord.findMany({
-    where: { position: { stockId } },
+    where: { position: { stockId, assetType: 'STOCK' } },
     orderBy: { soldAt: 'desc' },
   })
   const armed = sells
@@ -265,7 +288,7 @@ async function lightCheckStock(
   if (!stock) return { checked: 0, fired: null }
 
   const lastLog = await prisma.refreshLog.findFirst({
-    where: { position: { stockId } },
+    where: { position: { stockId, assetType: 'STOCK' } },
     orderBy: { refreshedAt: 'desc' },
     select: { verdict: true },
   })

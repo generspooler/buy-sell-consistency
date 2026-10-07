@@ -5,7 +5,29 @@ import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { fmtPrice } from '@/lib/format'
 import { describeTrigger, pullbackToPrice, MIN_PULLBACK_PCT } from '@/lib/reentry'
-import type { AddBuyAnalysis, HistoryEvent, HistoryEventType, ReentryPlan } from '@/lib/types'
+import type {
+  AddBuyAnalysis,
+  HistoryEvent,
+  HistoryEventType,
+  OptionSnapshot,
+  ReentryPlan,
+  StockSnapshot,
+} from '@/lib/types'
+import {
+  NEAR_EXPIRY_DAYS,
+  SIDE_LABEL,
+  OptionContext,
+  breakevenPrice,
+  closeActionLabel,
+  daysToExpiry,
+  describeProgress,
+  fmtStrike,
+  isExpired,
+  openActionLabel,
+  optionContextOf,
+  optionLongLabel,
+  optionProgress,
+} from '@/lib/options'
 
 interface Stock { symbol: string; name: string; market: string }
 interface BuyRecord {
@@ -27,6 +49,19 @@ interface Position {
   stock: Stock; buyRecords: BuyRecord[]
   refreshLogs: RefreshLog[]; sellRecords: SellRecord[]
   history: HistoryEvent[]
+  // 期权（v0.4）
+  assetType?: string; side?: string; multiplier?: number
+  contractSymbol?: string | null; optionType?: string | null
+  strike?: number | null; expiry?: string | null
+  settlement?: Settlement | null
+}
+/** 到期待结算建议（/api/positions/[id]，仅已过到期时点的 OPEN 期权） */
+interface Settlement {
+  expiry: string
+  underlyingClose: number | null
+  basis: 'EXPIRY_CANDLE' | 'LAST_CANDLE' | 'NONE'
+  outcome: 'WORTHLESS' | 'ITM' | null
+  intrinsic: number | null
 }
 interface ThesisPoint { id: string; point: string; status?: string; evidence?: string; trend?: string }
 interface AnalysisResult {
@@ -80,6 +115,18 @@ const PLAN_STATUS_META: Record<string, { label: string; chip: string }> = {
 }
 
 const fmtDateTime = (iso: string) => new Date(iso).toLocaleString('zh-CN')
+const fmtIv = (iv?: number) => (iv != null ? `${(iv * 100).toFixed(1)}%` : 'N/A')
+
+const SELL_REASONS = ['止盈', '止损', '逻辑破坏', '换仓', '其他']
+
+const parseSnapshot = (raw?: string | null): StockSnapshot | null => {
+  if (!raw || raw === '{}') return null
+  try {
+    return JSON.parse(raw) as StockSnapshot
+  } catch {
+    return null
+  }
+}
 const fmtSigned = (n: number, digits = 0) => `${n >= 0 ? '+' : ''}${n.toFixed(digits)}`
 const pnlClass = (n: number) => (n >= 0 ? 'text-emerald-400' : 'text-rose-400')
 
@@ -128,18 +175,29 @@ function AddBuyAnalysisBlock({ analysis }: { analysis: AddBuyAnalysis | null }) 
   )
 }
 
-function TradeFacts({ price, shares, amount }: { price: number; shares: number; amount: number }) {
+function TradeFacts({ price, shares, amount, isOption }: {
+  price: number; shares: number; amount: number; isOption?: boolean
+}) {
   return (
     <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm text-neutral-400">
-      <span>价格 <span className="text-neutral-200">{fmtPrice(price)}</span></span>
-      <span>股数 <span className="text-neutral-200">{shares}</span></span>
+      <span>{isOption ? '权利金' : '价格'} <span className="text-neutral-200">{fmtPrice(price)}</span></span>
+      <span>{isOption ? '张数' : '股数'} <span className="text-neutral-200">{shares}</span></span>
       <span>金额 <span className="text-neutral-200">{amount.toFixed(0)}</span></span>
     </div>
   )
 }
 
-function HistoryEventCard({ event }: { event: HistoryEvent }) {
+// 期权开平仓的标签按方向换：买方「买入开仓 / 卖出平仓」，卖方反之。
+function eventLabel(event: HistoryEvent, option: OptionContext | null, fallback: string): string {
+  if (!option) return fallback
+  if (event.type === 'BUY') return openActionLabel(option.side)
+  if (event.type === 'SELL') return closeActionLabel(option.side)
+  return fallback
+}
+
+function HistoryEventCard({ event, option }: { event: HistoryEvent; option: OptionContext | null }) {
   const meta = event.type === 'REENTRY' ? REENTRY_KIND_META[event.kind] : EVENT_META[event.type]
+  const isOption = option != null
   return (
     <div className={`relative pl-8 ${event.type === 'REENTRY' && event.kind === 'FIRED' ? 'ring-2 ring-amber-400/40 rounded-xl' : ''}`}>
       <span className={`absolute left-[7px] top-5 h-2.5 w-2.5 -translate-x-1/2 rounded-full ring-4 ring-neutral-950 ${meta.dot}`} />
@@ -148,7 +206,7 @@ function HistoryEventCard({ event }: { event: HistoryEvent }) {
       }`}>
         <div className="mb-3 flex items-center gap-3">
           <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${meta.chip}`}>
-            {meta.label}
+            {eventLabel(event, option, meta.label)}
           </span>
           <span className="text-xs text-neutral-500">{fmtDateTime(event.at)}</span>
           {event.type === 'REFRESH' && (
@@ -171,11 +229,11 @@ function HistoryEventCard({ event }: { event: HistoryEvent }) {
 
         {(event.type === 'BUY' || event.type === 'ADD_BUY') && (
           <div className="space-y-3">
-            <TradeFacts price={event.price} shares={event.shares} amount={event.amount} />
+            <TradeFacts price={event.price} shares={event.shares} amount={event.amount} isOption={isOption} />
             {event.thesis && (
               <div>
                 <p className="mb-1 text-xs text-neutral-500">
-                  {event.type === 'BUY' ? '买入理由' : '加仓理由'}
+                  {event.type === 'BUY' ? (isOption ? '开仓理由' : '买入理由') : '加仓理由'}
                 </p>
                 <p className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-200">{event.thesis}</p>
               </div>
@@ -243,7 +301,7 @@ function HistoryEventCard({ event }: { event: HistoryEvent }) {
 
         {event.type === 'SELL' && (
           <div className="space-y-3">
-            <TradeFacts price={event.price} shares={event.shares} amount={event.amount} />
+            <TradeFacts price={event.price} shares={event.shares} amount={event.amount} isOption={isOption} />
             <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm text-neutral-400">
               <span>原因 <span className="text-neutral-200">{event.reason}</span></span>
               {event.realizedPnl == null && <span className="text-neutral-600">已实现盈亏未记录</span>}
@@ -323,6 +381,47 @@ function HistoryEventCard({ event }: { event: HistoryEvent }) {
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+// 期权快照对比：开仓时 vs 最近刷新。开仓时的 IV / delta 是判断「IV 回落」
+// 「方向对了却没赚钱」的唯一基准。
+function OptionSnapshotTable({ open, latest }: { open?: OptionSnapshot; latest?: OptionSnapshot }) {
+  const rows: Array<[string, (o?: OptionSnapshot) => string]> = [
+    ['权利金(mark)', o => fmtPrice(o?.mark)],
+    ['隐含波动率 IV', o => fmtIv(o?.iv)],
+    ['Delta', o => o?.delta?.toFixed(3) ?? 'N/A'],
+    ['Theta(每股每日)', o => o?.theta?.toFixed(3) ?? 'N/A'],
+    ['标的价格', o => fmtPrice(o?.underlyingPrice)],
+    ['距盈亏平衡', o => (o?.distToBreakevenPct != null ? `${o.distToBreakevenPct >= 0 ? '+' : ''}${o.distToBreakevenPct.toFixed(1)}%` : 'N/A')],
+    ['价内/价外', o => o?.moneyness ?? 'N/A'],
+    ['剩余天数', o => (o ? `${o.dte} 天` : 'N/A')],
+  ]
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-xs text-neutral-500">
+            <th className="py-1 text-left font-normal">期权指标</th>
+            <th className="py-1 text-right font-normal">开仓时</th>
+            {latest && <th className="py-1 text-right font-normal">最近刷新</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(([label, f]) => (
+            <tr key={label} className="border-t border-neutral-800/70">
+              <td className="py-1.5 text-neutral-500">{label}</td>
+              <td className="py-1.5 text-right text-neutral-200">{f(open)}</td>
+              {latest && <td className="py-1.5 text-right text-neutral-200">{f(latest)}</td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="mt-2 text-xs text-neutral-600">
+        数据源：{open?.dataSource ?? 'N/A'}
+        {latest && ` → ${latest.dataSource}`}
+      </p>
     </div>
   )
 }
@@ -556,12 +655,15 @@ function ReentryPlanFields({
 function AddBuyForm({
   positionId,
   currentShares,
+  isOption,
   onDone,
 }: {
   positionId: number
   currentShares: number
+  isOption: boolean
   onDone: () => void
 }) {
+  const unit = isOption ? '张' : '股'
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10))
   const [shares, setShares] = useState('')
   const [price, setPrice] = useState('')
@@ -610,7 +712,7 @@ function AddBuyForm({
         <div>
           <p className="text-sm font-medium text-emerald-400">加仓已记录 ✓</p>
           <p className="mt-1 text-xs text-neutral-400">
-            成本均价与持仓数已更新。本次加仓未附买入理由，论点基准仍以首笔买入为准。
+            成本均价与持仓数已更新。论点基准仍以首笔{isOption ? '开仓' : '买入'}为准。
             本次加仓与下方分析结论已一并写入「历史记录」。
           </p>
         </div>
@@ -635,7 +737,8 @@ function AddBuyForm({
       <div>
         <h3 className="font-semibold text-neutral-100">加仓</h3>
         <p className="mt-0.5 text-xs text-neutral-500">
-          当前持仓 {currentShares} 股 · 成本均价将按本次加仓自动重算
+          当前持仓 {currentShares} {unit} · 成本均价将按本次加仓自动重算
+          {isOption && '（同一合约、同一方向）'}
         </p>
       </div>
       <div className="grid grid-cols-3 gap-3">
@@ -645,13 +748,13 @@ function AddBuyForm({
             className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2.5 text-sm text-neutral-100 focus:border-indigo-500 focus:outline-none" />
         </div>
         <div>
-          <label className="block text-sm font-medium text-neutral-300 mb-1.5">股数</label>
+          <label className="block text-sm font-medium text-neutral-300 mb-1.5">{isOption ? '张数' : '股数'}</label>
           <input type="number" value={shares} onChange={e => setShares(e.target.value)}
-            min="1" placeholder="100"
+            min="1" placeholder={isOption ? '1' : '100'}
             className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2.5 text-sm text-neutral-100 placeholder-neutral-500 focus:border-indigo-500 focus:outline-none" />
         </div>
         <div>
-          <label className="block text-sm font-medium text-neutral-300 mb-1.5">价格</label>
+          <label className="block text-sm font-medium text-neutral-300 mb-1.5">{isOption ? '权利金 / 股' : '价格'}</label>
           <input type="number" value={price} onChange={e => setPrice(e.target.value)}
             step="0.001" min="0" placeholder="0.000"
             className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2.5 text-sm text-neutral-100 placeholder-neutral-500 focus:border-indigo-500 focus:outline-none" />
@@ -823,6 +926,43 @@ export default function PositionDetailPage() {
   const pnlColor = (position.realizedPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
   const history = position.history ?? []
 
+  // 期权（v0.4）：合约上下文 + 最近一次期权快照（刷新优先，否则开仓快照）
+  const optionCtx = optionContextOf(position, position.stock.symbol)
+  const isOption = optionCtx != null
+  const unit = isOption ? '张' : '股'
+  const expiredPending = position.status === 'OPEN' && optionCtx != null && isExpired(optionCtx.expiry)
+  const buySnapshot = parseSnapshot(firstBuy?.snapshotJson)
+  const latestSnapshot = parseSnapshot(latestRefresh?.snapshotJson)
+  const openOpt = buySnapshot?.option
+  const latestOpt = latestSnapshot?.option
+  const currentOpt = latestOpt ?? openOpt
+  const progress =
+    optionCtx && currentOpt
+      ? optionProgress({
+          side: optionCtx.side,
+          optionType: optionCtx.optionType,
+          strike: optionCtx.strike,
+          premium: optionCtx.premium,
+          openedAt: optionCtx.openedAt,
+          expiry: optionCtx.expiry,
+          underlyingAtOpen: openOpt?.underlyingPrice,
+          underlyingNow: currentOpt.underlyingPrice,
+          mark: currentOpt.mark,
+          theta: currentOpt.theta,
+        })
+      : null
+  const sellReasons = expiredPending ? ['到期作废', ...SELL_REASONS] : SELL_REASONS
+
+  /** 到期结算：预填平仓表单并切到该页，仍由用户点确认（评分照常进行）。 */
+  const prefillClose = (reason: string, price: string, note: string) => {
+    setSellReason(reason)
+    setSellPrice(price)
+    setSellShares(String(position.totalShares))
+    if (optionCtx) setSellDate(optionCtx.expiry)
+    setSellNote(note)
+    setActiveTab('sell')
+  }
+
   // 已触发待执行的买回计划：整页最高优先级提示。
   const plansOnPosition = position.sellRecords.map(sr => ({
     sr,
@@ -894,16 +1034,99 @@ export default function PositionDetailPage() {
         </div>
       )}
 
+      {/* ── 期权到期待结算横幅（V1：价外一键作废；价内按实际结算手工记录）── */}
+      {expiredPending && optionCtx && (
+        <div className="mb-6 rounded-xl border border-amber-400/50 bg-amber-400/10 p-5">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-amber-300">期权已到期 · 待结算</p>
+              {(() => {
+                const st = position.settlement
+                if (!st || st.outcome == null || st.underlyingClose == null) {
+                  return (
+                    <p className="mt-1.5 text-sm leading-relaxed text-neutral-200">
+                      未取到到期日标的收盘价，请按券商实际结算记录平仓。
+                    </p>
+                  )
+                }
+                const basis =
+                  st.basis === 'EXPIRY_CANDLE'
+                    ? `到期日 ${st.expiry} 标的收盘 ${fmtPrice(st.underlyingClose)}`
+                    : `到期日 K 线暂缺，按到期前最后收盘 ${fmtPrice(st.underlyingClose)} 估算`
+                return (
+                  <p className="mt-1.5 text-sm leading-relaxed text-neutral-200">
+                    {basis}，行权价 {fmtStrike(optionCtx.strike)}：
+                    {st.outcome === 'WORTHLESS'
+                      ? `价外到期，合约作废——${optionCtx.side === 'LONG' ? '买方损失全部权利金' : '卖方保留全部权利金'}。`
+                      : `价内 ${fmtPrice(st.intrinsic)} / 股，合约多半已${optionCtx.side === 'LONG' ? '自动行权' : '被指派'}。当前版本不自动处理行权 / 指派：请按券商实际结算价记录平仓（原因选「其他」），对应的正股交易另行记录。`}
+                  </p>
+                )
+              })()}
+            </div>
+            <div className="flex shrink-0 flex-col gap-2">
+              {position.settlement?.outcome === 'WORTHLESS' ? (
+                <button
+                  onClick={() => prefillClose('到期作废', '0', '')}
+                  className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:bg-amber-400 transition-colors"
+                >
+                  按到期作废结算
+                </button>
+              ) : (
+                <button
+                  onClick={() =>
+                    prefillClose(
+                      '其他',
+                      position.settlement?.intrinsic != null ? position.settlement.intrinsic.toFixed(2) : '',
+                      position.settlement?.intrinsic != null
+                        ? `价内到期${optionCtx.side === 'LONG' ? '行权' : '被指派'}，按内在价值 ${position.settlement.intrinsic.toFixed(2)} 结算`
+                        : ''
+                    )
+                  }
+                  className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:bg-amber-400 transition-colors"
+                >
+                  去记录结算
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Header ── */}
       <div className="mb-6 rounded-xl border border-neutral-800 bg-neutral-900 p-6">
         <div className="flex items-start justify-between">
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-xl font-semibold text-neutral-100">{position.stock.name}</h1>
-              <span className="text-sm text-neutral-500">{position.stock.symbol}</span>
-              <span className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-500">
-                {position.stock.market}
+              <h1 className="text-xl font-semibold text-neutral-100">
+                {optionCtx ? optionLongLabel(optionCtx) : position.stock.name}
+              </h1>
+              <span className="text-sm text-neutral-500">
+                {optionCtx ? position.stock.name : position.stock.symbol}
               </span>
+              <span className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-500">
+                {optionCtx ? `${position.stock.market} · 期权` : position.stock.market}
+              </span>
+              {optionCtx && (
+                <span className={`rounded border px-1.5 py-0.5 text-xs ${
+                  optionCtx.side === 'SHORT'
+                    ? 'border-violet-400/30 bg-violet-400/10 text-violet-300'
+                    : 'border-sky-400/30 bg-sky-400/10 text-sky-300'
+                }`}>
+                  {SIDE_LABEL[optionCtx.side]}
+                </span>
+              )}
+              {optionCtx && position.status === 'OPEN' && !expiredPending && (() => {
+                const dte = daysToExpiry(optionCtx.expiry)
+                return (
+                  <span className={`rounded border px-1.5 py-0.5 text-xs ${
+                    dte <= NEAR_EXPIRY_DAYS
+                      ? 'border-rose-400/30 bg-rose-400/10 text-rose-300'
+                      : 'border-neutral-700 text-neutral-400'
+                  }`}>
+                    剩 {dte} 天
+                  </span>
+                )
+              })()}
               {position.status === 'CLOSED' && (
                 <span className="rounded border border-neutral-600 px-1.5 py-0.5 text-xs text-neutral-400">
                   已平仓
@@ -911,13 +1134,37 @@ export default function PositionDetailPage() {
               )}
             </div>
             <div className="mt-2 flex items-center gap-4 text-sm text-neutral-400">
-              <span>成本均价 <span className="text-neutral-200">{fmtPrice(position.avgCost)}</span></span>
-              <span>持仓 <span className="text-neutral-200">{position.totalShares}</span> 股</span>
-              <span>总成本 <span className="text-neutral-200">{position.totalCost.toFixed(0)}</span></span>
+              <span>{isOption ? '开仓均价（权利金）' : '成本均价'} <span className="text-neutral-200">{fmtPrice(position.avgCost)}</span></span>
+              <span>持仓 <span className="text-neutral-200">{position.totalShares}</span> {unit}</span>
+              <span>
+                {optionCtx?.side === 'SHORT' ? '收取权利金' : '总成本'}{' '}
+                <span className="text-neutral-200">{position.totalCost.toFixed(0)}</span>
+              </span>
               {position.realizedPnl != null && (
                 <span>已实现盈亏 <span className={pnlColor}>{position.realizedPnl >= 0 ? '+' : ''}{position.realizedPnl.toFixed(0)}</span></span>
               )}
             </div>
+            {optionCtx && (
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-neutral-400">
+                <span>
+                  到期盈亏平衡{' '}
+                  <span className="text-neutral-200">
+                    {fmtPrice(breakevenPrice(optionCtx.optionType, optionCtx.strike, optionCtx.premium))}
+                  </span>
+                </span>
+                {currentOpt && (
+                  <span>
+                    权利金 <span className="text-neutral-200">{fmtPrice(currentOpt.mark)}</span>
+                    {' · '}IV {fmtIv(currentOpt.iv)} · Δ {currentOpt.delta?.toFixed(2) ?? 'N/A'}
+                    {' · '}标的 {fmtPrice(currentOpt.underlyingPrice)}
+                    <span className="text-neutral-600">（{latestOpt ? '最近刷新' : '开仓快照'} {fmtDateTime(currentOpt.dataTime)}）</span>
+                  </span>
+                )}
+                {progress && position.status === 'OPEN' && !expiredPending && (
+                  <span className="basis-full text-neutral-300">{describeProgress(progress, optionCtx.side)}</span>
+                )}
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-3">
             {latestRefresh?.verdict && (
@@ -925,7 +1172,7 @@ export default function PositionDetailPage() {
                 {VERDICT_LABEL[latestRefresh.verdict]}
               </span>
             )}
-            {position.status === 'OPEN' ? (
+            {expiredPending ? null : position.status === 'OPEN' ? (
               <button
                 onClick={handleRefresh}
                 disabled={refreshing}
@@ -958,7 +1205,11 @@ export default function PositionDetailPage() {
       {/* ── Tabs ── */}
       <div className="mb-6 flex gap-1 border-b border-neutral-800">
         {(['thesis', 'history', 'sell'] as TabId[]).map(tab => {
-          const labels = { thesis: '买入理由', history: `历史记录 (${history.length})`, sell: '加仓/卖出' }
+          const labels = {
+            thesis: isOption ? '开仓理由' : '买入理由',
+            history: `历史记录 (${history.length})`,
+            sell: isOption ? '加仓/平仓' : '加仓/卖出',
+          }
           return (
             <button
               key={tab}
@@ -981,8 +1232,8 @@ export default function PositionDetailPage() {
           {/* Thesis text */}
           <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-5">
             <h3 className="text-xs font-medium text-neutral-500 uppercase tracking-wide mb-3">
-              买入理由原文 · {new Date(firstBuy.boughtAt).toLocaleDateString('zh-CN')} ·
-              {fmtPrice(firstBuy.price)} × {firstBuy.shares} 股
+              {isOption ? '开仓' : '买入'}理由原文 · {new Date(firstBuy.boughtAt).toLocaleDateString('zh-CN')} ·
+              {fmtPrice(firstBuy.price)} × {firstBuy.shares} {unit}
             </h3>
             <p className="text-sm text-neutral-200 leading-relaxed whitespace-pre-wrap">{firstBuy.thesis}</p>
           </div>
@@ -1028,7 +1279,7 @@ export default function PositionDetailPage() {
               return (
                 <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-5">
                   <h3 className="text-xs font-medium text-neutral-500 uppercase tracking-wide mb-3">
-                    买入时快照
+                    {isOption ? '开仓时快照（标的）' : '买入时快照'}
                   </h3>
                   <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm">
                     <div className="flex justify-between">
@@ -1056,6 +1307,11 @@ export default function PositionDetailPage() {
                       <span className="text-neutral-400 text-xs">{snap.context?.dataSource ?? 'N/A'}</span>
                     </div>
                   </div>
+                  {isOption && (openOpt || latestOpt) && (
+                    <div className="mt-4 border-t border-neutral-800 pt-4">
+                      <OptionSnapshotTable open={openOpt} latest={latestOpt} />
+                    </div>
+                  )}
                 </div>
               )
             } catch { return null }
@@ -1079,11 +1335,11 @@ export default function PositionDetailPage() {
                 <span className="text-neutral-200">{position.status === 'OPEN' ? '持仓中' : '已平仓'}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-neutral-500">成本均价</span>
+                <span className="text-neutral-500">{isOption ? '开仓均价' : '成本均价'}</span>
                 <span className="text-neutral-200">{fmtPrice(position.avgCost)}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-neutral-500">持仓股数</span>
+                <span className="text-neutral-500">{isOption ? '持仓张数' : '持仓股数'}</span>
                 <span className="text-neutral-200">{position.totalShares}</span>
               </div>
               <div className="flex justify-between">
@@ -1098,9 +1354,9 @@ export default function PositionDetailPage() {
               </div>
             </div>
             <p className="mt-3 border-t border-neutral-800 pt-3 text-xs text-neutral-500">
-              共 {history.length} 条记录 · 买入 {history.filter(e => e.type === 'BUY' || e.type === 'ADD_BUY').length}
+              共 {history.length} 条记录 · {isOption ? '开仓' : '买入'} {history.filter(e => e.type === 'BUY' || e.type === 'ADD_BUY').length}
               {' · '}刷新 {history.filter(e => e.type === 'REFRESH').length}
-              {' · '}卖出 {history.filter(e => e.type === 'SELL').length}
+              {' · '}{isOption ? '平仓' : '卖出'} {history.filter(e => e.type === 'SELL').length}
             </p>
           </div>
 
@@ -1118,7 +1374,7 @@ export default function PositionDetailPage() {
           ) : (
             <div className="relative space-y-4 before:absolute before:bottom-4 before:left-[7px] before:top-4 before:w-px before:bg-neutral-800">
               {history.map(event => (
-                <HistoryEventCard key={event.id} event={event} />
+                <HistoryEventCard key={event.id} event={event} option={optionCtx} />
               ))}
             </div>
           )}
@@ -1128,10 +1384,11 @@ export default function PositionDetailPage() {
       {/* ── Tab: Buy-more / Sell ── */}
       {activeTab === 'sell' && (
         <div className="max-w-lg space-y-6">
-          {position.status === 'OPEN' && (
+          {position.status === 'OPEN' && !expiredPending && (
             <AddBuyForm
               positionId={position.id}
               currentShares={position.totalShares}
+              isOption={isOption}
               onDone={fetchPosition}
             />
           )}
@@ -1146,7 +1403,7 @@ export default function PositionDetailPage() {
                       <span>{new Date(sr.soldAt).toLocaleDateString('zh-CN')}</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-neutral-500">价格/股数</span>
+                      <span className="text-neutral-500">{isOption ? '权利金/张数' : '价格/股数'}</span>
                       <span>{fmtPrice(sr.price)} × {sr.shares}</span>
                     </div>
                     <div className="flex justify-between">
@@ -1170,7 +1427,7 @@ export default function PositionDetailPage() {
             </div>
           ) : sellResult ? (
             <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-6">
-              <h3 className="font-semibold text-emerald-400 mb-2">卖出已记录</h3>
+              <h3 className="font-semibold text-emerald-400 mb-2">{isOption ? '平仓' : '卖出'}已记录</h3>
               <div className="flex items-center gap-2 mb-3">
                 <span className="text-neutral-400 text-sm">一致性评分</span>
                 <span className={`text-lg font-semibold ${sellResult.score >= 70 ? 'text-emerald-400' : 'text-amber-400'}`}>
@@ -1191,35 +1448,43 @@ export default function PositionDetailPage() {
                   </p>
                 </div>
               )}
-              <p className="mt-3 text-xs text-neutral-400">本次卖出、盈亏与该评分已写入「历史记录」。</p>
+              <p className="mt-3 text-xs text-neutral-400">本次{isOption ? '平仓' : '卖出'}、盈亏与该评分已写入「历史记录」。</p>
             </div>
           ) : (
             <form onSubmit={handleSell} className="space-y-5">
               <div className="grid grid-cols-3 gap-3">
                 <div>
-                  <label className="block text-sm font-medium text-neutral-300 mb-1.5">卖出日期</label>
+                  <label className="block text-sm font-medium text-neutral-300 mb-1.5">{isOption ? '平仓日期' : '卖出日期'}</label>
                   <input type="date" value={sellDate} onChange={e => setSellDate(e.target.value)}
                     className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2.5 text-sm text-neutral-100 focus:border-indigo-500 focus:outline-none" />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-neutral-300 mb-1.5">股数</label>
+                  <label className="block text-sm font-medium text-neutral-300 mb-1.5">{isOption ? '张数' : '股数'}</label>
                   <input type="number" value={sellShares} onChange={e => setSellShares(e.target.value)}
                     placeholder={String(position.totalShares)} min="1" max={String(position.totalShares)}
                     className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2.5 text-sm text-neutral-100 placeholder-neutral-500 focus:border-indigo-500 focus:outline-none" />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-neutral-300 mb-1.5">卖出价</label>
+                  <label className="block text-sm font-medium text-neutral-300 mb-1.5">
+                    {isOption ? '平仓权利金' : '卖出价'}
+                  </label>
                   <input type="number" value={sellPrice} onChange={e => setSellPrice(e.target.value)}
+                    disabled={sellReason === '到期作废'}
                     step="0.001" min="0"
                     className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2.5 text-sm text-neutral-100 placeholder-neutral-500 focus:border-indigo-500 focus:outline-none" />
                 </div>
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-neutral-300 mb-1.5">卖出原因</label>
+                <label className="block text-sm font-medium text-neutral-300 mb-1.5">
+                  {isOption ? '平仓原因' : '卖出原因'}
+                </label>
                 <div className="flex flex-wrap gap-2">
-                  {['止盈', '止损', '逻辑破坏', '换仓', '其他'].map(r => (
-                    <button key={r} type="button" onClick={() => setSellReason(r)}
+                  {sellReasons.map(r => (
+                    <button key={r} type="button" onClick={() => {
+                      setSellReason(r)
+                      if (r === '到期作废') setSellPrice('0')
+                    }}
                       className={`rounded-lg border px-3 py-1.5 text-sm transition-colors ${
                         sellReason === r
                           ? 'border-indigo-500 bg-indigo-500/20 text-indigo-300'
@@ -1238,7 +1503,7 @@ export default function PositionDetailPage() {
                   className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-4 py-3 text-sm text-neutral-100 placeholder-neutral-600 focus:border-indigo-500 focus:outline-none" />
               </div>
 
-              <ReentryPlanFields
+              {!isOption && <ReentryPlanFields
                 enabled={planEnabled}
                 onToggle={setPlanEnabled}
                 positionId={position.id}
@@ -1258,7 +1523,12 @@ export default function PositionDetailPage() {
                 setSource={setPlanSource}
                 rationale={planRationale}
                 setRationale={setPlanRationale}
-              />
+              />}
+              {isOption && sellReason === '到期作废' && (
+                <p className="text-xs text-neutral-500">
+                  到期作废按 0 结算：{optionCtx?.side === 'SHORT' ? '卖方保留全部权利金' : '买方损失全部权利金'}。
+                </p>
+              )}
 
               {sellError && (
                 <p className="text-sm text-rose-400">{sellError}</p>
@@ -1266,7 +1536,7 @@ export default function PositionDetailPage() {
 
               <button type="submit" disabled={selling || !sellShares || !sellPrice}
                 className="rounded-lg bg-rose-600 px-6 py-2.5 text-sm font-medium text-white hover:bg-rose-500 disabled:opacity-50 transition-colors">
-                {selling ? '提交中，LLM评估一致性…' : '确认卖出'}
+                {selling ? '提交中，LLM评估一致性…' : isOption ? `确认${closeActionLabel(optionCtx?.side)}` : '确认卖出'}
               </button>
             </form>
           )}

@@ -2,14 +2,25 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { MarketDataService } from '@/lib/market-data'
 import { getUsdCny } from '@/lib/fx'
-import { Market } from '@/lib/types'
+import { Market, OptionPositionInfo } from '@/lib/types'
 import { parseReentryPlan, describeTrigger } from '@/lib/reentry'
+import {
+  breakevenPrice,
+  daysToExpiry,
+  isExpired,
+  optionContextOf,
+  optionShortLabel,
+  positionPnl,
+  positionPnlPct,
+} from '@/lib/options'
 
 const marketDataService = new MarketDataService()
 
 // GET /api/positions — list all open positions with latest price.
 // Each row also carries its re-entry plan state (ARMED/FIRED) for the
 // home-page badges; terminal states stay in the position's history timeline.
+// Option rows (v0.4): currentPrice = the contract's mark premium, PnL via the
+// shared sign × multiplier formula, plus contract info under `option`.
 export async function GET() {
   const positions = await prisma.position.findMany({
     where: { status: 'OPEN' },
@@ -27,16 +38,53 @@ export async function GET() {
       let currentPrice: number | undefined
       let changePct: number | undefined
       let degraded = false
-      try {
-        const snap = await marketDataService.buildSnapshot(
-          pos.stock.symbol,
-          pos.stock.market as Market
-        )
-        currentPrice = snap.market.price
-        changePct = snap.market.changePct
-        degraded = snap.context.degraded ?? false
-      } catch {
-        // Non-fatal: show position without live price
+      const optionCtx = optionContextOf(pos, pos.stock.symbol)
+      let option: OptionPositionInfo | undefined
+      if (optionCtx) {
+        const expired = isExpired(optionCtx.expiry)
+        option = {
+          contractSymbol: optionCtx.contractSymbol,
+          underlying: optionCtx.underlying,
+          optionType: optionCtx.optionType,
+          strike: optionCtx.strike,
+          expiry: optionCtx.expiry,
+          side: optionCtx.side,
+          multiplier: optionCtx.multiplier,
+          label: optionShortLabel(optionCtx),
+          dte: daysToExpiry(optionCtx.expiry),
+          expired,
+          breakeven: breakevenPrice(optionCtx.optionType, optionCtx.strike, optionCtx.premium),
+        }
+        try {
+          // 已到期合约不在期权链里，只取标的价（待结算判断用）
+          const snap = expired
+            ? await marketDataService.buildSnapshot(pos.stock.symbol, 'US')
+            : await marketDataService.buildOptionSnapshot(optionCtx, optionCtx.premium)
+          option.underlyingPrice = snap.market.price
+          option.underlyingChangePct = snap.market.changePct
+          if (snap.option) {
+            currentPrice = snap.option.mark
+            option.distToBreakevenPct = snap.option.distToBreakevenPct
+            option.iv = snap.option.iv
+            option.delta = snap.option.delta
+            option.degraded = snap.option.degraded
+            degraded = snap.option.degraded ?? false
+          }
+        } catch {
+          // Non-fatal: show position without live price
+        }
+      } else {
+        try {
+          const snap = await marketDataService.buildSnapshot(
+            pos.stock.symbol,
+            pos.stock.market as Market
+          )
+          currentPrice = snap.market.price
+          changePct = snap.market.changePct
+          degraded = snap.context.degraded ?? false
+        } catch {
+          // Non-fatal: show position without live price
+        }
       }
 
       const lastRefresh = pos.refreshLogs[0]
@@ -74,11 +122,11 @@ export async function GET() {
 
       const unrealizedPnl =
         currentPrice != null
-          ? (currentPrice - pos.avgCost) * pos.totalShares
+          ? positionPnl(pos, currentPrice, pos.totalShares)
           : undefined
       const unrealizedPnlPct =
         currentPrice != null && pos.avgCost > 0
-          ? ((currentPrice - pos.avgCost) / pos.avgCost) * 100
+          ? positionPnlPct(pos, currentPrice)
           : undefined
 
       return {
@@ -87,6 +135,8 @@ export async function GET() {
         name: pos.stock.name,
         market: pos.stock.market,
         status: pos.status,
+        assetType: pos.assetType,
+        option,
         totalShares: pos.totalShares,
         avgCost: pos.avgCost,
         totalCost: pos.totalCost,
@@ -104,11 +154,11 @@ export async function GET() {
     })
   )
 
-  // Sort: BROKEN → WEAKEN → SUPPORT → (no verdict)
+  // Sort: 待结算期权 → BROKEN → WEAKEN → SUPPORT → (no verdict)
   const verdictOrder = { BROKEN: 0, WEAKEN: 1, SUPPORT: 2 }
   results.sort((a, b) => {
-    const va = verdictOrder[a.lastVerdict as keyof typeof verdictOrder] ?? 3
-    const vb = verdictOrder[b.lastVerdict as keyof typeof verdictOrder] ?? 3
+    const va = a.option?.expired ? -1 : verdictOrder[a.lastVerdict as keyof typeof verdictOrder] ?? 3
+    const vb = b.option?.expired ? -1 : verdictOrder[b.lastVerdict as keyof typeof verdictOrder] ?? 3
     return va - vb
   })
 
@@ -143,11 +193,15 @@ export async function GET() {
       if (plan?.status === 'FIRED') { activePlan = 'FIRED'; break }
       if (plan?.status === 'ARMED') activePlan = 'ARMED'
     }
+    const optionCtx = optionContextOf(pos, pos.stock.symbol)
     return {
       id: pos.id,
       symbol: pos.stock.symbol,
       name: pos.stock.name,
       market: pos.stock.market,
+      assetType: pos.assetType,
+      optionLabel: optionCtx ? optionShortLabel(optionCtx) : undefined,
+      side: pos.side,
       closedAt: pos.closedAt,
       openedAt: pos.openedAt,
       realizedPnl: pos.realizedPnl,

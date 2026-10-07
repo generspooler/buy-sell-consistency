@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { extractThesisPoints } from '@/lib/llm-analyzer'
 import { StockSnapshot } from '@/lib/types'
+import { optionContextOf } from '@/lib/options'
 
 // POST /api/thesis-points — LLM-extract thesis points for an existing buy record.
 // Body: { buyRecordId: number } | { buyRecordId, points: [...] } to save user-edited points.
@@ -44,7 +45,8 @@ export async function POST(req: NextRequest) {
     const extracted = await extractThesisPoints(
       record.thesis,
       snapshot,
-      record.position.stock.name
+      record.position.stock.name,
+      optionContextOf(record.position, record.position.stock.symbol)
     )
     await prisma.buyRecord.update({
       where: { id: buyRecordId },

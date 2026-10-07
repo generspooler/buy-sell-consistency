@@ -9,26 +9,43 @@ import { EastmoneyAdapter } from './datasources/eastmoney'
 import { SinaAdapter } from './datasources/sina'
 import { TencentUSAdapter } from './datasources/tencent-us'
 import { TencentCNAdapter } from './datasources/tencent-cn'
-import { IMarketDataSource } from './datasources/types'
+import { CboeOptionsAdapter } from './datasources/cboe-options'
+import { NasdaqOptionsAdapter } from './datasources/nasdaq-options'
+import { IMarketDataSource, IOptionDataSource, OptionChain } from './datasources/types'
 import { computeAllIndicators, Candle } from './indicators'
-import { StockSnapshot, Market } from './types'
+import { StockSnapshot, Market, OptionType } from './types'
+import { computeOptionBlock } from './options'
 
-// Simple in-memory cache
+// Simple in-memory cache. Concurrent misses on the same key share one request
+// (an option chain is ~2MB / ~10s; a stock + an option on the same underlying
+// refreshing in parallel must not fetch it twice).
 interface CacheEntry<T> { value: T; expiresAt: number }
 const cache = new Map<string, CacheEntry<unknown>>()
+const inflight = new Map<string, Promise<unknown>>()
 
 function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
   const entry = cache.get(key) as CacheEntry<T> | undefined
   if (entry && entry.expiresAt > Date.now()) return Promise.resolve(entry.value)
-  return fn().then(value => {
-    cache.set(key, { value, expiresAt: Date.now() + ttlMs })
-    return value
-  })
+  const pending = inflight.get(key) as Promise<T> | undefined
+  if (pending) return pending
+  const p = fn()
+    .then(value => {
+      cache.set(key, { value, expiresAt: Date.now() + ttlMs })
+      return value
+    })
+    .finally(() => inflight.delete(key))
+  inflight.set(key, p)
+  return p
 }
 
 const QUOTE_TTL = 5 * 60 * 1000      // 5 min
 const FINANCIAL_TTL = 24 * 60 * 60 * 1000 // 24 hours
 const NEWS_TTL = 60 * 60 * 1000      // 1 hour
+const OPTION_TTL = 5 * 60 * 1000     // 5 min — CBOE itself is 15 min delayed
+/** After a CBOE failure, go straight to Nasdaq for a while instead of
+ *  waiting out the 25s timeout on every call. */
+const OPTION_PRIMARY_COOLDOWN = 5 * 60 * 1000
+let optionPrimaryDownUntil = 0
 
 function isFiniteNum(v: number | undefined | null): v is number {
   return typeof v === 'number' && Number.isFinite(v)
@@ -44,9 +61,81 @@ export class MarketDataService {
   private cnFallback: IMarketDataSource = new SinaAdapter()
   private us: IMarketDataSource = new TencentUSAdapter()
   private cnEnricher: IMarketDataSource = new TencentCNAdapter()
+  private optPrimary: IOptionDataSource = new CboeOptionsAdapter()
+  private optFallback: IOptionDataSource = new NasdaqOptionsAdapter()
 
   private source(market: Market): IMarketDataSource {
     return market === 'US' ? this.us : this.cnPrimary
+  }
+
+  /**
+   * 美股期权链。CBOE（主，含 IV/希腊值）一次返回全部到期日，按标的整链缓存
+   * 后在内存里过滤；失败降级 Nasdaq（无希腊值），结果标 degraded。
+   */
+  async getOptionChain(underlying: string, expiry?: string): Promise<OptionChain> {
+    const sym = underlying.toUpperCase()
+    if (Date.now() >= optionPrimaryDownUntil) {
+      try {
+        const full = await cached(`optchain:cboe:${sym}`, OPTION_TTL, () =>
+          this.optPrimary.getChain(sym)
+        )
+        return expiry
+          ? { ...full, contracts: full.contracts.filter(c => c.expiry === expiry) }
+          : full
+      } catch (e) {
+        console.warn('[MarketDataService] CBOE option chain failed, falling back to Nasdaq:', e)
+        optionPrimaryDownUntil = Date.now() + OPTION_PRIMARY_COOLDOWN
+      }
+    }
+    const chain = await cached(`optchain:nasdaq:${sym}:${expiry ?? '*'}`, OPTION_TTL, () =>
+      this.optFallback.getChain(sym, expiry)
+    )
+    return { ...chain, degraded: true }
+  }
+
+  /**
+   * 期权持仓快照 = 标的四块快照 + 期权块。期权报价取不到（链降级失败、合约
+   * 已到期下架）时仍返回期权块：条款与内在价值照算，报价字段留空并标 degraded。
+   * premiumBasis = 持仓权利金，用于盈亏平衡价；省略时以 mark 暂代。
+   */
+  async buildOptionSnapshot(
+    contract: {
+      underlying: string
+      contractSymbol: string
+      optionType: OptionType
+      strike: number
+      expiry: string
+    },
+    premiumBasis?: number
+  ): Promise<StockSnapshot> {
+    const [snapResult, chainResult] = await Promise.allSettled([
+      this.buildSnapshot(contract.underlying, 'US'),
+      this.getOptionChain(contract.underlying, contract.expiry),
+    ])
+    if (snapResult.status === 'rejected') throw snapResult.reason
+    const snap = snapResult.value
+    const chain = chainResult.status === 'fulfilled' ? chainResult.value : null
+    const quote = chain?.contracts.find(c => c.contractSymbol === contract.contractSymbol) ?? null
+    const underlyingPrice = snap.market.price > 0 ? snap.market.price : chain?.underlyingPrice ?? 0
+
+    let dataSource: string
+    if (!chain) dataSource = '期权行情不可用'
+    else if (!quote) dataSource = `${chain.source}（未找到该合约报价）`
+    else dataSource = chain.hasGreeks ? chain.source : `${chain.source}（降级·无希腊值）`
+
+    return {
+      ...snap,
+      option: computeOptionBlock({
+        ...contract,
+        quote,
+        underlyingPrice,
+        underlyingIv30: chain?.underlyingIv30,
+        premiumBasis,
+        dataSource,
+        dataTime: chain?.dataTime ?? new Date().toISOString(),
+        degraded: !quote || !chain?.hasGreeks || chain?.degraded,
+      }),
+    }
   }
 
   /**

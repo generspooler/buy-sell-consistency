@@ -27,6 +27,15 @@ model Position {
   avgCost      Float       @default(0)
   totalCost    Float       @default(0)
   realizedPnl  Float?
+  // 期权（v0.4）：一张合约 = 一个持仓，stock 仍指向标的。正股行取默认值。
+  // shares/price 对期权表示「张数 / 每股权利金」，金额 = 张数 × 权利金 × multiplier。
+  assetType      String    @default("STOCK") // "STOCK" | "OPTION"
+  side           String    @default("LONG")  // "LONG" | "SHORT"（正股恒为 LONG）
+  multiplier     Int       @default(1)       // 正股 1，标准美股期权 100
+  contractSymbol String?                     // OCC 代码，如 NVDA261120C00240000
+  optionType     String?                     // "CALL" | "PUT"
+  strike         Float?
+  expiry         DateTime?                   // 到期日（UTC 零点存日期）
   buyRecords   BuyRecord[]
   sellRecords  SellRecord[]
   refreshLogs  RefreshLog[]

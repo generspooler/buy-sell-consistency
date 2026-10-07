@@ -3,6 +3,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import Link from 'next/link'
 import { fmtPrice } from '@/lib/format'
+import { NEAR_EXPIRY_DAYS, SIDE_LABEL } from '@/lib/options'
+import type { OptionPositionInfo } from '@/lib/types'
 
 interface Position {
   id: number
@@ -21,6 +23,8 @@ interface Position {
   lastActionSuggestion?: string
   openedAt: string
   degraded?: boolean
+  assetType?: string
+  option?: OptionPositionInfo
   reentry?: {
     status: 'ARMED' | 'FIRED'
     desc: string
@@ -42,6 +46,9 @@ interface ClosedPosition {
   symbol: string
   name: string
   market: string
+  assetType?: string
+  optionLabel?: string
+  side?: string
   closedAt?: string
   openedAt: string
   realizedPnl?: number
@@ -433,48 +440,105 @@ export default function HomePage() {
           {positions.map(pos => {
             const pnlPct = pos.unrealizedPnlPct
             const pnlPos = (pnlPct ?? 0) >= 0
+            const opt = pos.option
             return (
               <div
                 key={pos.id}
-                className="group rounded-xl border border-neutral-800 bg-neutral-900 p-5 hover:border-neutral-700 transition-colors"
+                className={`group rounded-xl border bg-neutral-900 p-5 transition-colors ${
+                  opt?.expired
+                    ? 'border-amber-400/50 hover:border-amber-400/70'
+                    : 'border-neutral-800 hover:border-neutral-700'
+                }`}
               >
                 <div className="flex items-start justify-between">
                   <div className="flex items-start gap-4">
                     <div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <Link
                           href={`/position/${pos.id}`}
                           className="font-semibold text-neutral-100 hover:text-white"
                         >
-                          {pos.name}
+                          {opt ? opt.label : pos.name}
                         </Link>
-                        <span className="text-xs text-neutral-500">{pos.symbol}</span>
+                        <span className="text-xs text-neutral-500">{opt ? pos.name : pos.symbol}</span>
                         <span className="rounded border border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-500">
-                          {pos.market}
+                          {opt ? `${pos.market} · 期权` : pos.market}
                         </span>
+                        {opt && (
+                          <span className={`rounded border px-1.5 py-0.5 text-xs ${
+                            opt.side === 'SHORT'
+                              ? 'border-violet-400/30 bg-violet-400/10 text-violet-300'
+                              : 'border-sky-400/30 bg-sky-400/10 text-sky-300'
+                          }`}>
+                            {SIDE_LABEL[opt.side]}
+                          </span>
+                        )}
+                        {opt && (opt.expired ? (
+                          <span className="rounded border border-amber-400/40 bg-amber-400/15 px-1.5 py-0.5 text-xs font-medium text-amber-200">
+                            已到期 · 待结算
+                          </span>
+                        ) : (
+                          <span className={`rounded border px-1.5 py-0.5 text-xs ${
+                            opt.dte <= NEAR_EXPIRY_DAYS
+                              ? 'border-rose-400/30 bg-rose-400/10 text-rose-300'
+                              : 'border-neutral-700 text-neutral-400'
+                          }`}>
+                            剩 {opt.dte} 天
+                          </span>
+                        ))}
                         {pos.degraded && (
                           <span className="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-xs text-amber-400">
                             数据降级
                           </span>
                         )}
                       </div>
-                      <div className="mt-1 flex items-center gap-4 text-sm">
-                        {pos.currentPrice != null ? (
+                      {opt ? (
+                        <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
                           <span className="text-neutral-200 font-medium">
-                            {fmtPrice(pos.currentPrice)}
-                            {pos.changePct != null && (
-                              <span className={`ml-1 text-xs ${pos.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {pos.changePct >= 0 ? '+' : ''}{pos.changePct.toFixed(2)}%
+                            {pos.currentPrice != null ? (
+                              <>权利金 {fmtPrice(pos.currentPrice)}</>
+                            ) : (
+                              <span className="text-neutral-500 text-xs font-normal">
+                                {opt.expired ? '合约已到期，无报价' : '权利金获取中…'}
                               </span>
                             )}
                           </span>
-                        ) : (
-                          <span className="text-neutral-500 text-xs">价格获取中…</span>
-                        )}
-                        <span className="text-neutral-500 text-xs">
-                          成本 {fmtPrice(pos.avgCost)} · {pos.totalShares} 股
-                        </span>
-                      </div>
+                          {opt.underlyingPrice != null && (
+                            <span className="text-xs text-neutral-400">
+                              标的 {fmtPrice(opt.underlyingPrice)}
+                              {opt.underlyingChangePct != null && (
+                                <span className={`ml-1 ${opt.underlyingChangePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                  {opt.underlyingChangePct >= 0 ? '+' : ''}{opt.underlyingChangePct.toFixed(2)}%
+                                </span>
+                              )}
+                            </span>
+                          )}
+                          <span className="text-neutral-500 text-xs">
+                            成本 {fmtPrice(pos.avgCost)} · {pos.totalShares} 张
+                            {opt.breakeven != null && ` · 盈亏平衡 ${fmtPrice(opt.breakeven)}`}
+                            {opt.distToBreakevenPct != null &&
+                              `（标的需 ${opt.distToBreakevenPct >= 0 ? '+' : ''}${opt.distToBreakevenPct.toFixed(1)}%）`}
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="mt-1 flex items-center gap-4 text-sm">
+                          {pos.currentPrice != null ? (
+                            <span className="text-neutral-200 font-medium">
+                              {fmtPrice(pos.currentPrice)}
+                              {pos.changePct != null && (
+                                <span className={`ml-1 text-xs ${pos.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                  {pos.changePct >= 0 ? '+' : ''}{pos.changePct.toFixed(2)}%
+                                </span>
+                              )}
+                            </span>
+                          ) : (
+                            <span className="text-neutral-500 text-xs">价格获取中…</span>
+                          )}
+                          <span className="text-neutral-500 text-xs">
+                            成本 {fmtPrice(pos.avgCost)} · {pos.totalShares} 股
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -517,7 +581,11 @@ export default function HomePage() {
                 {/* Bottom row */}
                 <div className="mt-3 flex items-center justify-between">
                   <div className="flex-1 pr-4">
-                    {pos.lastActionSuggestion ? (
+                    {opt?.expired ? (
+                      <p className="text-xs text-amber-300/90 leading-relaxed">
+                        已过到期日 {opt.expiry}，请在详情页结算（价外到期可一键作废；行权 / 被指派按实际结算记录）
+                      </p>
+                    ) : pos.lastActionSuggestion ? (
                       <p className="text-xs text-neutral-400 leading-relaxed">
                         {pos.lastActionSuggestion}
                       </p>
@@ -531,18 +599,22 @@ export default function HomePage() {
                         {new Date(pos.lastRefreshedAt).toLocaleDateString('zh-CN')}
                       </span>
                     )}
-                    <button
-                      onClick={() => handleRefreshOne(pos.id)}
-                      disabled={refreshing}
-                      className="rounded-lg border border-neutral-700 px-3 py-1 text-xs text-neutral-400 hover:border-neutral-600 hover:text-neutral-200 disabled:opacity-40 transition-colors"
-                    >
-                      刷新
-                    </button>
+                    {!opt?.expired && (
+                      <button
+                        onClick={() => handleRefreshOne(pos.id)}
+                        disabled={refreshing}
+                        className="rounded-lg border border-neutral-700 px-3 py-1 text-xs text-neutral-400 hover:border-neutral-600 hover:text-neutral-200 disabled:opacity-40 transition-colors"
+                      >
+                        刷新
+                      </button>
+                    )}
                     <Link
                       href={`/position/${pos.id}`}
-                      className="rounded-lg border border-neutral-700 px-3 py-1 text-xs text-neutral-400 hover:border-neutral-600 hover:text-neutral-200 transition-colors"
+                      className={opt?.expired
+                        ? 'rounded-lg bg-amber-500 px-3 py-1 text-xs font-medium text-neutral-950 hover:bg-amber-400 transition-colors'
+                        : 'rounded-lg border border-neutral-700 px-3 py-1 text-xs text-neutral-400 hover:border-neutral-600 hover:text-neutral-200 transition-colors'}
                     >
-                      详情
+                      {opt?.expired ? '去结算' : '详情'}
                     </Link>
                   </div>
                 </div>
@@ -595,9 +667,11 @@ export default function HomePage() {
                             href={`/position/${c.id}`}
                             className="font-medium text-neutral-300 hover:text-neutral-100"
                           >
-                            {c.name}
+                            {c.optionLabel ?? c.name}
                           </Link>
-                          <span className="text-xs text-neutral-600">{c.symbol}</span>
+                          <span className="text-xs text-neutral-600">
+                            {c.optionLabel ? `${c.name} · 期权${c.side === 'SHORT' ? '卖方' : '买方'}` : c.symbol}
+                          </span>
                           {c.activePlan && (
                             <span
                               className={`rounded-full border px-2 py-0.5 text-xs ${

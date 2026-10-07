@@ -15,6 +15,7 @@ A local-first investment decision tracker that records why you bought a stock, r
 - **持仓详情**：查看论点演变时间线、最新数据、新闻信号和历史分析结果。
 - **记录卖出**：记录卖出原因，LLM 会给出 0-100 的买卖一致性评分和说明。
 - **买回计划**：卖出时若打算之后买回，可当场把“待回调买入”定成一个带数字的触发条件；此后每次刷新自动检查，条件达成时高亮提醒。
+- **美股期权**：买入开仓与卖出开仓（Call / Put）都能记录，从期权链里选合约；论点拆解、刷新分析与平仓评分都按期权的时间维度进行，到期后提示结算。
 
 ### 买回计划
 
@@ -30,6 +31,23 @@ A local-first investment decision tracker that records why you bought a stock, r
 **在哪里看**：首页顶部「买回监控」区块常驻列出所有监控中与已触发的计划（含已清仓的股票），显示触发条件、现价和“距触发还需下跌 X%”，已触发的置顶高亮。清仓后股票不再出现在持仓列表里，但计划仍然活着，这个区块就是它的常驻可见面——不点刷新也看得到。
 
 触发条件锁定后不可修改，只能取消后重立——这个特性的价值来自事前承诺，事后调价会让阈值被合理化。回撤门槛默认不低于 10%：日波动 2-3% 的标的，5 个交易日累计波动约 5-6%，更小的回调在统计上属于噪音。
+
+### 美股期权
+
+在“记录买入”里选中美股后切到“期权”：
+
+1. 选方向（买入开仓 / 卖出开仓）、类型（Call / Put）、到期日、行权价。到期日与行权价来自期权链，行权价下拉里带权利金与 Delta，默认选平值。
+2. 填张数与每股权利金（默认带入买卖中间价，可改）。表单当场显示合计金额（× 100）与到期盈亏平衡价。
+3. 写开仓理由。期权论点要写清楚方向、幅度和期限——系统拆解论点时会要求至少一条“到期日前标的 ≥ / ≤ 某价位”的时间限定论点。
+
+一张合约是一个独立持仓，挂在标的股票下；同一合约、同一方向再开仓就是加仓。正股与期权互不合并，各自有论点、各自刷新。
+
+- **刷新**：标的快照之外再采集期权数据（权利金、IV、Delta、Theta、剩余天数、距盈亏平衡），并算出“时间已过 X%、标的走完到盈亏平衡距离的 Y%”这类进度（卖方是“距行权价缓冲”与“已赚取权利金”）。LLM 按期权规则判断：方向对但时间不够、或押注波动率而 IV 回落，都至少判为“动摇”。
+- **盈亏**：金额都乘以 100。卖方的盈亏 % 以收取的权利金为基数（以 0 买回 = +100%），期权浮盈并入首页的美股汇总。
+- **平仓**：买方是“卖出平仓”，卖方是“买入平仓”，同样有一致性评分。期权不设买回计划；买一张期权也不会把同一只股票的正股买回计划标成“已执行”。
+- **到期**：过了美东到期日 16:00 仍未平仓的合约显示为“已到期 · 待结算”，首页置顶。详情页按到期日收盘价判断价内 / 价外：价外可一键按“到期作废”（按 0）结算；价内多半已行权 / 被指派——当前版本不自动处理，请按券商实际结算价记录平仓（原因选“其他”），对应的正股交易另行记录。
+
+期权行情来自 CBOE 延迟报价（约 15 分钟延迟，含 IV 与希腊值），失败时降级到 Nasdaq（无 IV / 希腊值，界面标“降级”）。首次拉取一只标的的期权链约需 3-10 秒，之后 5 分钟内走缓存。
 
 ### 已平仓与复盘
 
@@ -64,6 +82,7 @@ LLM_MODEL="claude-opus-5"
 
 - A 股行情来自东方财富，约 15 分钟延迟；备用源为新浪财经。
 - 美股行情来自腾讯财经，新闻来自 Google News RSS 和 SEC EDGAR。
+- 美股期权链来自 CBOE 延迟报价（约 15 分钟延迟），备用源为 Nasdaq。
 - 所有持仓、交易记录和分析结果保存在本地 SQLite 数据库中。
 
 ## English
@@ -77,6 +96,7 @@ A locally running buy/sell consistency tracker. It records your full buying rati
 - **Position details**: Review a timeline of thesis changes, current market data, news signals, and historical analyses.
 - **Record sells**: Record the sale reason and receive an LLM-generated 0-100 consistency score with an explanation.
 - **Re-entry plans**: If you intend to buy back later, turn "wait for a pullback" into a concrete trigger at sell time. Every refresh then checks it automatically and flags the position when the conditions are met.
+- **U.S. options**: Record long and short (sell-to-open) calls and puts, picked from the option chain. Thesis extraction, refresh analysis and close scoring all account for the option's time window, and expired contracts are flagged for settlement.
 
 ### Re-entry plans
 
@@ -92,6 +112,19 @@ A plan moves through `ARMED → FIRED / EXPIRED / CANCELLED`. Recording a buy of
 **Where you see it**: a "买回监控" block at the top of the home page always lists every armed and fired plan — including stocks you have fully sold — with its trigger, the current price, and how much further the price has to fall. Fired plans sort to the top and are highlighted. A fully-sold stock leaves the position list but its plan is still live, and this block is where it stays visible without clicking refresh.
 
 Triggers cannot be edited once locked — cancel and create a new plan instead. The value of this feature comes from pre-commitment, and editing a threshold after the fact is how it gets rationalized away. Pullback triggers default to a 10% floor: for a stock that moves 2-3% a day, five sessions add up to roughly 5-6%, so anything smaller is statistically noise.
+
+### U.S. options
+
+Pick a U.S. stock on the buy page and switch to "期权". Choose the side (buy to open / sell to open), call or put, expiry and strike from the option chain (the strike list shows premium and delta and defaults to at-the-money), then enter contracts and premium per share (prefilled with the bid/ask midpoint). The form shows the total (× 100) and the breakeven at expiry. Write the thesis with direction, size and a deadline — extraction requires at least one time-bound price point such as "underlying ≥ X before expiry".
+
+Each contract is its own position under the underlying stock; opening the same contract on the same side again adds to it. Stock and option positions never merge, and each has its own thesis and refresh.
+
+- **Refresh** adds option data (premium, IV, delta, theta, days left, distance to breakeven) and progress metrics such as "60% of the time used, 20% of the way to breakeven" (for short positions: cushion to strike and premium captured). Being right on direction but short on time, or betting on volatility while IV falls, counts as at least WEAKEN.
+- **PnL** applies the 100× multiplier. Short PnL % is measured against the premium received (buying back at 0 = +100%). Option PnL is included in the U.S. total on the home page.
+- **Closing** is sell-to-close for long and buy-to-close for short, with the same consistency score. Options have no re-entry plans, and buying an option never marks a stock re-entry plan as executed.
+- **Expiry**: a contract still open after 16:00 ET on its expiry date shows as "已到期 · 待结算" at the top of the home page. The detail page checks the expiry-day close: out-of-the-money contracts settle at 0 with one click ("到期作废"); in-the-money contracts were likely exercised or assigned — this version does not automate that, so record the close at the broker's settlement price with reason "其他" and record the resulting stock trade separately.
+
+Option quotes come from CBOE delayed quotes (about 15 minutes delayed, with IV and greeks), falling back to Nasdaq (no IV or greeks, flagged as degraded). The first chain load for an underlying takes about 3–10 seconds; it is cached for 5 minutes.
 
 ### Closed positions and review
 
@@ -126,4 +159,5 @@ LLM_MODEL="claude-opus-5"
 
 - Chinese A-share quotes come from Eastmoney and are delayed by about 15 minutes; Sina Finance is the fallback source.
 - U.S. stock quotes come from Tencent Finance; news comes from Google News RSS and SEC EDGAR.
+- U.S. option chains come from CBOE delayed quotes (about 15 minutes delayed), with Nasdaq as the fallback.
 - Positions, trades, and analyses are stored in a local SQLite database.

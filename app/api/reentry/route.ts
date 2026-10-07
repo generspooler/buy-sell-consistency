@@ -41,6 +41,9 @@ export async function POST(req: NextRequest) {
     if (!position) {
       return NextResponse.json({ error: 'Position not found' }, { status: 404 })
     }
+    if (position.assetType === 'OPTION') {
+      return NextResponse.json({ error: '期权持仓不支持买回计划' }, { status: 400 })
+    }
 
     const thesisPoints: ThesisPoint[] = position.buyRecords[0]?.thesisPointsJson
       ? JSON.parse(position.buyRecords[0].thesisPointsJson)

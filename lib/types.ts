@@ -4,7 +4,10 @@ export type Market = 'CN' | 'US'
 export type PositionStatus = 'OPEN' | 'CLOSED'
 export type Verdict = 'SUPPORT' | 'WEAKEN' | 'BROKEN'
 export type ThesisPointStatus = 'HELD' | 'WEAKENED' | 'BROKEN'
-export type SellReason = '止盈' | '止损' | '逻辑破坏' | '换仓' | '其他'
+export type SellReason = '止盈' | '止损' | '逻辑破坏' | '换仓' | '其他' | '到期作废'
+export type AssetType = 'STOCK' | 'OPTION'
+export type PositionSide = 'LONG' | 'SHORT'
+export type OptionType = 'CALL' | 'PUT'
 
 // ─── Snapshot (buy-time + refresh-time, same shape) ──────────────────────────
 
@@ -64,12 +67,49 @@ export interface ContextSnapshot {
   degraded?: boolean
 }
 
+/**
+ * 期权块（v0.4）：期权持仓的快照 = 标的四块快照 + 本块。
+ * 开仓时的 IV / delta 是日后判断「IV 回落」「方向对了却没赚钱」的唯一基准。
+ * breakeven 等派生值以持仓权利金（avgCost）为基准，开仓前以 mark 暂代。
+ */
+export interface OptionSnapshot {
+  contractSymbol: string
+  underlying: string
+  optionType: OptionType
+  strike: number
+  expiry: string            // YYYY-MM-DD
+  dte: number               // 剩余日历天数（美东日期）
+  bid?: number
+  ask?: number
+  mark?: number             // 买卖中间价；无报价时退回 last
+  last?: number
+  volume?: number
+  openInterest?: number
+  iv?: number               // 小数，0.33 = 33%；降级源为空
+  delta?: number
+  gamma?: number
+  theta?: number            // 每股每日
+  vega?: number
+  underlyingPrice: number
+  underlyingIv30?: number   // 百分数，28.7 = 28.7%
+  intrinsic: number
+  extrinsic?: number
+  premiumBasis?: number     // 计算 breakeven 用的权利金
+  breakeven?: number
+  distToBreakevenPct?: number // 标的需再变动多少 % 到盈亏平衡（正 = 需上涨）
+  moneyness: 'ITM' | 'ATM' | 'OTM'
+  dataSource: string
+  dataTime: string
+  degraded?: boolean
+}
+
 export interface StockSnapshot {
   schemaVersion: number
   market: MarketSnapshot
   valuation: ValuationSnapshot
   technicals: TechnicalSnapshot
   context: ContextSnapshot
+  option?: OptionSnapshot   // 仅期权持仓
 }
 
 // ─── Thesis Points ────────────────────────────────────────────────────────────
@@ -194,6 +234,27 @@ export interface ReentryEvent extends HistoryEventBase {
 }
 
 // ─── API Response Types ───────────────────────────────────────────────────────
+
+/** 持仓列表中期权行的合约与实时派生信息（/api/positions）。 */
+export interface OptionPositionInfo {
+  contractSymbol: string
+  underlying: string
+  optionType: OptionType
+  strike: number
+  expiry: string
+  side: PositionSide
+  multiplier: number
+  label: string               // NVDA 240C 11/20
+  dte: number
+  expired: boolean            // 已过到期时点、仍未结算
+  underlyingPrice?: number
+  underlyingChangePct?: number
+  breakeven?: number
+  distToBreakevenPct?: number
+  iv?: number
+  delta?: number
+  degraded?: boolean
+}
 
 export interface PositionSummary {
   id: number
