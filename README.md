@@ -15,6 +15,7 @@ A local-first investment decision tracker that records why you bought a stock, r
 - **持仓详情**：查看论点演变时间线、最新数据、新闻信号和历史分析结果。
 - **记录卖出**：记录卖出原因，LLM 会给出 0-100 的买卖一致性评分和说明。
 - **买回计划**：卖出时若打算之后买回，可当场把“待回调买入”定成一个带数字的触发条件；此后每次刷新自动检查，条件达成时高亮提醒。
+- **区间收益**：首页按日期区间统计总收益（区间内已实现盈亏 + 当前浮动盈亏，折算 CNY 并分列 A股 / 美股），默认第一笔交易至今，可切近 30 天、近 90 天、今年或自选区间。
 - **美股期权**：买入开仓与卖出开仓（Call / Put）都能记录，从期权链里选合约；论点拆解、刷新分析与平仓评分都按期权的时间维度进行，到期后提示结算。
 
 ### 买回计划
@@ -54,6 +55,14 @@ A local-first investment decision tracker that records why you bought a stock, r
 首页底部「已平仓」折叠区列出全部已平仓持仓（平仓日、持有天数、已实现盈亏、买卖一致性评分），点进去即是完整的历史记录时间线：建仓、加仓、每次刷新分析、卖出与买回计划的全部流转。
 
 已平仓且仍有买回计划的持仓，详情页提供「检查买回计划」按钮，只核对价格与论点闸门，不调用 LLM。
+
+### 区间收益
+
+首页顶部的「区间收益」按日期区间汇总总收益。日期只筛选**卖出记录**：区间内每笔平仓的已实现盈亏直接相加；当区间末端覆盖今天时，再并入当前持仓的浮动盈亏。A 股为 CNY、美股为 USD，用实时汇率折算成一个 CNY 合计，同时分列两个市场。
+
+默认区间是「第一笔交易 → 今天」，也可以切换近 30 天 / 近 90 天 / 今年，或手动选择起止日期。**选过去的区间时只统计已实现盈亏**——系统只存交易日与刷新时刻的快照，没有逐日行情，历史某一天的浮盈无法回溯。
+
+不提供收益率：区间跨越建仓与部分平仓时，「投入成本」没有唯一口径，强行给一个数字比不给更容易误导。
 
 ### 快速开始
 
@@ -96,6 +105,7 @@ A locally running buy/sell consistency tracker. It records your full buying rati
 - **Position details**: Review a timeline of thesis changes, current market data, news signals, and historical analyses.
 - **Record sells**: Record the sale reason and receive an LLM-generated 0-100 consistency score with an explanation.
 - **Re-entry plans**: If you intend to buy back later, turn "wait for a pullback" into a concrete trigger at sell time. Every refresh then checks it automatically and flags the position when the conditions are met.
+- **Range P&L**: the home page totals performance over a date range (realized P&L within the range plus current unrealized P&L, converted to CNY and split by market), defaulting to the first trade through today, with 30-day / 90-day / year-to-date / custom ranges.
 - **U.S. options**: Record long and short (sell-to-open) calls and puts, picked from the option chain. Thesis extraction, refresh analysis and close scoring all account for the option's time window, and expired contracts are flagged for settlement.
 
 ### Re-entry plans
@@ -131,6 +141,14 @@ Option quotes come from CBOE delayed quotes (about 15 minutes delayed, with IV a
 A collapsed "已平仓" section at the bottom of the home page lists every closed position (close date, holding period, realized PnL, consistency score) and links to its full history timeline: the opening buy, add-ons, every refresh analysis, the sell, and all re-entry plan transitions.
 
 Closed positions that still carry a plan get a "检查买回计划" button on the detail page, which evaluates the price and thesis gates without calling the LLM.
+
+### Range P&L
+
+The "区间收益" block at the top of the home page totals performance over a date range. Only **sell records** are filtered by date: every close inside the range contributes its realized P&L, and when the range ends today the current unrealized P&L is added. A-share amounts are CNY and U.S. amounts are USD; they are converted to a CNY total at the live rate while also being shown per market.
+
+The default range is "first trade → today"; you can switch to 30 days, 90 days, year-to-date, or pick custom dates. **For a past range only realized P&L is counted** — the app stores snapshots at trade and refresh time, not daily price history, so the unrealized P&L of an arbitrary past day cannot be reconstructed.
+
+There is no percentage return: across partial opens and closes in a range, "invested cost" has no single denominator, and a made-up figure misleads more than it informs.
 
 ### Quick Start
 

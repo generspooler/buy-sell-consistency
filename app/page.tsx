@@ -41,6 +41,24 @@ interface PnlSummary {
   pnlTotalCNY: number
 }
 
+/** 区间已实现盈亏（来自 /api/pnl/range）。浮动部分由当前持仓在前端合并。 */
+interface RangePnl {
+  from: string
+  to: string
+  defaultFrom: string
+  defaultTo: string
+  /** 区间末端覆盖今天时才把当前浮动盈亏并进总收益 */
+  includesNow: boolean
+  realized: {
+    cny: number
+    usd: number
+    totalCNY: number
+    count: number
+  }
+  usdCny: number
+  fxSource: 'live' | 'fallback'
+}
+
 interface ClosedPosition {
   id: number
   symbol: string
@@ -106,12 +124,36 @@ const VERDICT_LABEL: Record<string, string> = {
   BROKEN: '✗ 破坏',
 }
 
+/** 带符号的金额文本；四舍五入到 0 后不再显示「-0」。 */
+function fmtSigned(n: number, digits = 0): string {
+  const f = 10 ** digits
+  const r = Math.round(n * f) / f
+  const sign = r > 0 ? '+' : r < 0 ? '-' : ''
+  return `${sign}${Math.abs(r).toFixed(digits)}`
+}
+
+/** YYYY-MM-DD 加减天数（UTC 口径，与入库日期一致）。 */
+function shiftDay(base: string, days: number): string {
+  const d = new Date(`${base}T00:00:00.000Z`)
+  d.setUTCDate(d.getUTCDate() + days)
+  return d.toISOString().slice(0, 10)
+}
+
+const QUICK_RANGES: Array<{ key: string; label: string }> = [
+  { key: '30d', label: '近30天' },
+  { key: '90d', label: '近90天' },
+  { key: 'ytd', label: '今年' },
+  { key: 'all', label: '全部' },
+]
+
 export default function HomePage() {
   const [positions, setPositions] = useState<Position[]>([])
   const [closedPositions, setClosedPositions] = useState<ClosedPosition[]>([])
   const [reentryRows, setReentryRows] = useState<ReentryRow[]>([])
   const [showClosed, setShowClosed] = useState(false)
   const [pnlSummary, setPnlSummary] = useState<PnlSummary | null>(null)
+  const [rangePnl, setRangePnl] = useState<RangePnl | null>(null)
+  const [rangeLoading, setRangeLoading] = useState(false)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshProgress, setRefreshProgress] = useState<RefreshResult[]>([])
@@ -142,10 +184,28 @@ export default function HomePage() {
     }
   }, [])
 
+  const fetchRangePnl = useCallback(async (from?: string, to?: string) => {
+    setRangeLoading(true)
+    try {
+      const qs = new URLSearchParams()
+      if (from) qs.set('from', from)
+      if (to) qs.set('to', to)
+      const q = qs.toString()
+      const res = await fetch(`/api/pnl/range${q ? `?${q}` : ''}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setRangePnl(await res.json())
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setRangeLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
-    const load = async () => { await fetchPositions() }
+    // 区间收益独立于持仓行情：只读已落库的卖出记录，首次加载默认「开始 → 今天」。
+    const load = async () => { await Promise.all([fetchPositions(), fetchRangePnl()]) }
     void load()
-  }, [fetchPositions])
+  }, [fetchPositions, fetchRangePnl])
 
   const handleRefreshAll = async () => {
     setRefreshing(true)
@@ -190,6 +250,42 @@ export default function HomePage() {
     r => r.plan.status === 'ARMED' || r.plan.status === 'FIRED'
   )
   const firedCount = activePlans.filter(r => r.plan.status === 'FIRED').length
+
+  // ── 区间收益 ─────────────────────────────────────────────────────────────
+  // 总收益 = 区间内已实现盈亏 + 当前浮动盈亏（仅当区间末端覆盖今天）。
+  // 历史区间只算已实现：系统没有逐日行情，过去某天的浮盈无法回溯。
+  const realizedCNY = rangePnl?.realized.cny ?? 0
+  const realizedUSD = rangePnl?.realized.usd ?? 0
+  const realizedTotalCNY = rangePnl?.realized.totalCNY ?? 0
+  const includeFloating = !!rangePnl?.includesNow && !!pnlSummary
+  const floatingCNY = includeFloating ? (pnlSummary?.pnlTotalCNY ?? 0) : 0
+  const floatingCN = includeFloating ? (pnlSummary?.pnlCNY ?? 0) : 0
+  const floatingUS = includeFloating ? (pnlSummary?.pnlUSD ?? 0) : 0
+  const rangeTotalCNY = realizedTotalCNY + floatingCNY
+  const rangeFx = rangePnl?.usdCny ?? pnlSummary?.usdCny ?? 0
+
+  const applyQuick = (key: string) => {
+    if (!rangePnl) return
+    const today = rangePnl.defaultTo
+    const from =
+      key === '30d' ? shiftDay(today, -29)
+      : key === '90d' ? shiftDay(today, -89)
+      : key === 'ytd' ? `${today.slice(0, 4)}-01-01`
+      : rangePnl.defaultFrom
+    void fetchRangePnl(from, today)
+  }
+
+  const activeQuick = (() => {
+    if (!rangePnl) return null
+    const today = rangePnl.defaultTo
+    const candidates: Array<[string, string]> = [
+      ['30d', shiftDay(today, -29)],
+      ['90d', shiftDay(today, -89)],
+      ['ytd', `${today.slice(0, 4)}-01-01`],
+      ['all', rangePnl.defaultFrom],
+    ]
+    return candidates.find(([, f]) => rangePnl.from === f && rangePnl.to === today)?.[0] ?? null
+  })()
 
   return (
     <div>
@@ -274,6 +370,109 @@ export default function HomePage() {
               {brokenCount}
             </p>
           </div>
+        </div>
+      )}
+
+      {/* ── 区间收益（复盘视角）────────────────────────────────────────
+          总收益 = 区间内卖出已实现 + 当前浮动；历史区间只算已实现。
+          日期只筛卖出记录，已实现盈亏在平仓时即落库，无需再拉行情。 */}
+      {!loading && rangePnl && (
+        <div className="mb-6 rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-sm font-medium text-neutral-300">区间收益</h2>
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="date"
+                  value={rangePnl.from}
+                  onChange={e => {
+                    if (e.target.value) void fetchRangePnl(e.target.value, rangePnl.to)
+                  }}
+                  className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs text-neutral-300"
+                />
+                <span className="text-xs text-neutral-600">→</span>
+                <input
+                  type="date"
+                  value={rangePnl.to}
+                  onChange={e => {
+                    if (e.target.value) void fetchRangePnl(rangePnl.from, e.target.value)
+                  }}
+                  className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs text-neutral-300"
+                />
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {QUICK_RANGES.map(({ key, label }) => (
+                <button
+                  key={key}
+                  onClick={() => applyQuick(key)}
+                  className={`rounded border px-2 py-1 text-xs transition-colors ${
+                    activeQuick === key
+                      ? 'border-indigo-500/50 bg-indigo-500/15 text-indigo-300'
+                      : 'border-neutral-700 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-end gap-x-8 gap-y-3">
+            <div>
+              <p className="text-xs text-neutral-500">
+                总收益
+                {rangeLoading && <span className="ml-1 text-neutral-600">更新中…</span>}
+              </p>
+              <p className={`mt-1 text-2xl font-semibold ${rangeTotalCNY >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {fmtSigned(rangeTotalCNY)}
+                <span className="ml-1 text-xs font-normal text-neutral-500">CNY</span>
+              </p>
+              <p className="mt-0.5 text-xs text-neutral-500">
+                已实现{' '}
+                <span className={realizedTotalCNY >= 0 ? 'text-emerald-500' : 'text-rose-500'}>
+                  {fmtSigned(realizedTotalCNY)}
+                </span>
+                {includeFloating && (
+                  <>
+                    {' · '}浮动{' '}
+                    <span className={floatingCNY >= 0 ? 'text-emerald-500' : 'text-rose-500'}>
+                      {fmtSigned(floatingCNY)}
+                    </span>
+                  </>
+                )}
+                {rangePnl.realized.count > 0 && (
+                  <span className="ml-1 text-neutral-600">（{rangePnl.realized.count} 笔已平仓）</span>
+                )}
+              </p>
+            </div>
+
+            <div className="text-xs text-neutral-500">
+              <p>
+                A股{' '}
+                <span className={realizedCNY + floatingCN >= 0 ? 'text-emerald-500' : 'text-rose-500'}>
+                  {fmtSigned(realizedCNY + floatingCN)}
+                </span>{' '}
+                CNY
+              </p>
+              <p className="mt-0.5">
+                美股{' '}
+                <span className={realizedUSD + floatingUS >= 0 ? 'text-emerald-500' : 'text-rose-500'}>
+                  {fmtSigned(realizedUSD + floatingUS)}
+                </span>{' '}
+                USD
+                <span className="ml-1 text-neutral-600">
+                  （{fmtSigned((realizedUSD + floatingUS) * rangeFx)} CNY @{rangeFx.toFixed(4)}）
+                </span>
+              </p>
+            </div>
+          </div>
+
+          {!rangePnl.includesNow && (
+            <p className="mt-2 text-xs text-neutral-600">
+              区间末端早于今天：只统计已实现盈亏——系统没有逐日行情，历史某天的浮盈无法回溯。
+            </p>
+          )}
         </div>
       )}
 
