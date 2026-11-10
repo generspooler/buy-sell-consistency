@@ -84,7 +84,9 @@ npm run dev
 ```env
 DATABASE_URL="file:./dev.db"
 LLM_COMMAND="claude"
-LLM_MODEL="claude-opus-5"
+LLM_MODEL="glm-5.3-mb"
+LLM_EFFORT="max"
+LLM_THINKING="1"
 ```
 
 ### 数据说明
@@ -170,7 +172,9 @@ Optional configuration in `.env`:
 ```env
 DATABASE_URL="file:./dev.db"
 LLM_COMMAND="claude"
-LLM_MODEL="claude-opus-5"
+LLM_MODEL="glm-5.3-mb"
+LLM_EFFORT="max"
+LLM_THINKING="1"
 ```
 
 ### Data Notes

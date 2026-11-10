@@ -25,14 +25,24 @@ import {
 } from './options'
 
 const LLM_COMMAND = process.env.LLM_COMMAND ?? 'claude'
-const LLM_MODEL = process.env.LLM_MODEL ?? 'claude-opus-5'
+const LLM_MODEL = process.env.LLM_MODEL ?? 'glm-5.3-mb'
+/** 推理强度：max 让模型把分析完整想完再落 JSON（low/medium/high/xhigh/max）。 */
+const LLM_EFFORT = process.env.LLM_EFFORT ?? 'max'
+/** 思维链开关。默认打开；设为 0/false 可关闭。 */
+const LLM_THINKING = process.env.LLM_THINKING ?? '1'
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS ?? 300_000)
 
 function runClaude(prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const args = ['-p', prompt]
     if (LLM_MODEL) args.push('--model', LLM_MODEL)
+    if (LLM_EFFORT) args.push('--effort', LLM_EFFORT)
+    if (LLM_THINKING !== '0' && LLM_THINKING.toLowerCase() !== 'false') {
+      args.push('--settings', JSON.stringify({ alwaysThinkingEnabled: true }))
+    }
 
-    const child = spawn(LLM_COMMAND, args, { env: process.env })
+    // stdin 不接管道：否则 claude 会等 3 秒才判定没有输入
+    const child = spawn(LLM_COMMAND, args, { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
 
@@ -41,8 +51,8 @@ function runClaude(prompt: string): Promise<string> {
 
     const timeout = setTimeout(() => {
       child.kill()
-      reject(new Error(`LLM timeout after 180s. stderr: ${stderr.slice(0, 200)}`))
-    }, 180_000)
+      reject(new Error(`LLM timeout after ${LLM_TIMEOUT_MS / 1000}s. stderr: ${stderr.slice(0, 200)}`))
+    }, LLM_TIMEOUT_MS)
 
     child.on('close', (code) => {
       clearTimeout(timeout)
